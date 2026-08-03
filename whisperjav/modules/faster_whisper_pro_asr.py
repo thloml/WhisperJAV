@@ -20,7 +20,7 @@ import traceback
 import logging
 
 from whisperjav.utils.logger import logger
-from whisperjav.utils.device_detector import get_best_device
+from whisperjav.utils.device_detector import get_best_device, is_rocm_build
 from whisperjav.utils.parameter_tracer import NullTracer
 from whisperjav.utils.crash_tracer import get_tracer
 from whisperjav.modules.segment_filters import SegmentFilterConfig, SegmentFilterHelper
@@ -57,6 +57,17 @@ class FasterWhisperProASR:
                 "Apple Silicon MPS detected, but faster-whisper/ctranslate2 doesn't support MPS. "
                 "Using CPU mode with Apple Accelerate optimization. "
                 "For GPU acceleration on Mac, use --mode transformers instead."
+            )
+            self.device = "cpu"
+
+        # CTRANSLATE2 COMPATIBILITY: no ROCm (AMD GPU) backend
+        # On ROCm PyTorch builds, torch.cuda.is_available() is True, so
+        # get_best_device() returns "cuda" - but CTranslate2 cannot use it.
+        if self.device == "cuda" and is_rocm_build():
+            logger.warning(
+                "AMD GPU detected with ROCm PyTorch, but faster-whisper/ctranslate2 "
+                "has no ROCm backend. Using CPU mode. "
+                "For GPU acceleration on AMD, use --asr openai_whisper instead."
             )
             self.device = "cpu"
 

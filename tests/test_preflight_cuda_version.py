@@ -29,6 +29,7 @@ class TestCudaVersionComparison(unittest.TestCase):
             # This is the key part: compiled version is int 12090, runtime is string "12.9"
             mock_torch._C._cuda_getCompiledVersion.return_value = 12090
             mock_torch.version.cuda = "12.9"
+            mock_torch.version.hip = None  # NVIDIA CUDA build (not ROCm)
             
             # Mock CUDA operations
             mock_tensor = MagicMock()
@@ -65,6 +66,7 @@ class TestCudaVersionComparison(unittest.TestCase):
             # Different versions: 11080 -> "11.8", but runtime is "12.1"
             mock_torch._C._cuda_getCompiledVersion.return_value = 11080
             mock_torch.version.cuda = "12.1"
+            mock_torch.version.hip = None  # NVIDIA CUDA build (not ROCm)
             
             # Mock CUDA operations
             mock_tensor = MagicMock()

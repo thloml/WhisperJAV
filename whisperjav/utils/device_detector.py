@@ -109,17 +109,35 @@ def _check_rocm_available() -> Tuple[bool, Optional[str]]:
         return False, None
 
 
+def is_rocm_build() -> bool:
+    """
+    Check if the installed PyTorch is a ROCm (AMD GPU) build.
+
+    ROCm builds of torch expose torch.version.hip and expose the GPU
+    through the torch.cuda API.
+
+    Returns:
+        True if PyTorch was built with ROCm support, False otherwise
+    """
+    try:
+        import torch
+        return bool(getattr(torch.version, "hip", None))
+    except ImportError:
+        return False
+
+
 def get_best_device(prefer_cpu: bool = False) -> str:
     """
     Auto-detect and return the best available compute device.
 
     Priority order:
-    1. CUDA (NVIDIA GPUs) - highest compatibility
+    1. CUDA (NVIDIA GPUs or AMD GPUs via ROCm) - torch.cuda API covers both
     2. MPS (Apple Silicon) - native macOS GPU
     3. CPU (fallback or explicit preference)
 
-    Note: ROCm (AMD GPUs) detected but deferred to CPU due to
-    CTranslate2 dependency limitations in faster-whisper pipeline.
+    Note: On ROCm builds, "cuda" is returned for torch-based pipelines.
+    CTranslate2 (faster-whisper) has no ROCm backend, so those callers
+    should use get_ctranslate2_device() instead.
 
     Args:
         prefer_cpu: Force CPU mode even if GPU available
@@ -135,7 +153,7 @@ def get_best_device(prefer_cpu: bool = False) -> str:
         logger.debug("CPU mode explicitly requested")
         return "cpu"
 
-    # Priority 1: NVIDIA CUDA
+    # Priority 1: CUDA (NVIDIA CUDA or AMD ROCm, both via torch.cuda API)
     cuda_available, cuda_name = _check_cuda_available()
     if cuda_available:
         logger.debug(f"CUDA device detected: {cuda_name}")
@@ -147,17 +165,45 @@ def get_best_device(prefer_cpu: bool = False) -> str:
         logger.debug(f"MPS device detected: {mps_name}")
         return "mps"
 
-    # ROCm detection (informational only)
+    # ROCm detection (informational only, CPU torch installed)
     rocm_available, rocm_name = _check_rocm_available()
     if rocm_available:
         logger.warning(
-            f"AMD GPU detected ({rocm_name}), but ROCm support is limited. "
-            "Using CPU mode. See documentation for details."
+            f"AMD GPU detected ({rocm_name}), but PyTorch is not a ROCm build. "
+            "Install ROCm PyTorch to enable GPU acceleration. Using CPU mode."
         )
 
     # Fallback: CPU
     logger.debug("No compatible GPU detected, using CPU")
     return "cpu"
+
+
+def get_ctranslate2_device(prefer_cpu: bool = False) -> str:
+    """
+    Return a device string that is safe for CTranslate2 (faster-whisper).
+
+    CTranslate2 only supports "cuda" (NVIDIA) and "cpu". On AMD ROCm builds
+    of PyTorch, passing "cuda" to faster-whisper would fail because
+    CTranslate2 has no ROCm backend, so it falls back to CPU. Torch-based
+    pipelines (openai_whisper, stable_ts, transformers) can still use the
+    AMD GPU via get_best_device().
+
+    Args:
+        prefer_cpu: Force CPU mode even if GPU available
+
+    Returns:
+        Device string: "cuda" (NVIDIA only) or "cpu"
+    """
+    device = get_best_device(prefer_cpu)
+    if device == "cuda" and is_rocm_build():
+        logger.warning(
+            "AMD GPU detected with ROCm PyTorch, but faster-whisper/ctranslate2 "
+            "has no ROCm backend. Running the CTranslate2 pipeline on CPU. "
+            "For GPU-accelerated transcription on AMD, use --asr openai_whisper "
+            "(or stable_ts)."
+        )
+        return "cpu"
+    return device
 
 
 def get_device_info() -> Dict[str, any]:
@@ -250,7 +296,7 @@ def log_device_info():
         logger.info("✗ Apple MPS: Not available")
 
     if info['rocm']['available']:
-        logger.info(f"⚠ AMD ROCm: {info['rocm']['name']} (detected but unsupported)")
+        logger.info(f"✓ AMD ROCm: {info['rocm']['name']} (usable via torch.cuda API; ctranslate2 pipelines use CPU)")
     else:
         logger.info("✗ AMD ROCm: Not available")
 
