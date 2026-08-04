@@ -189,7 +189,11 @@ def translate_subtitle(
             print(f"[TRANSLATE]   API base: {provider_config['api_base']}", file=sys.stderr)
 
         # Build prompt
+        # The output-language sentence is repeated here (not only in the
+        # instruction file) because small/local models follow the user
+        # message more reliably than system instructions.
         prompt = f"Translate these subtitles from {source_lang} into {target_lang}."
+        prompt += f" CRITICAL: Write every Translation line in {target_lang} only. Never use English unless {target_lang} is english."
         if extra_context:
             prompt += "\n" + extra_context
             print(f"[TRANSLATE]   Extra context: {extra_context[:200]}", file=sys.stderr)

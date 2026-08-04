@@ -262,16 +262,11 @@ class WhisperVadSpeechSegmenter:
         device = self.device
         if device == "auto":
             import torch
-            from whisperjav.utils.device_detector import is_rocm_build
-            if torch.cuda.is_available() and not is_rocm_build():
+            from whisperjav.utils.device_detector import ct2_supports_gpu
+            if torch.cuda.is_available() and ct2_supports_gpu():
                 device = "cuda"
             else:
                 device = "cpu"
-            if is_rocm_build():
-                logger.info(
-                    "[WhisperVAD] ROCm PyTorch detected; ctranslate2 has no ROCm backend, "
-                    "using CPU for VAD."
-                )
             logger.info(f"[WhisperVAD] Auto-detected device: {device}")
 
         # Note: compute_type="auto" (default) lets CTranslate2 handle device-specific selection

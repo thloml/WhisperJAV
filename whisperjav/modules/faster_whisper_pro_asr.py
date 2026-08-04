@@ -20,7 +20,7 @@ import traceback
 import logging
 
 from whisperjav.utils.logger import logger
-from whisperjav.utils.device_detector import get_best_device, is_rocm_build
+from whisperjav.utils.device_detector import get_best_device, ct2_supports_gpu
 from whisperjav.utils.parameter_tracer import NullTracer
 from whisperjav.utils.crash_tracer import get_tracer
 from whisperjav.modules.segment_filters import SegmentFilterConfig, SegmentFilterHelper
@@ -60,14 +60,14 @@ class FasterWhisperProASR:
             )
             self.device = "cpu"
 
-        # CTRANSLATE2 COMPATIBILITY: no ROCm (AMD GPU) backend
-        # On ROCm PyTorch builds, torch.cuda.is_available() is True, so
-        # get_best_device() returns "cuda" - but CTranslate2 cannot use it.
-        if self.device == "cuda" and is_rocm_build():
+        # CTRANSLATE2 COMPATIBILITY: GPU requires a matching ctranslate2 build
+        # (CUDA for NVIDIA, ROCm/HIP for AMD). If the installed build cannot
+        # use the GPU (e.g. CPU-only ctranslate2), fall back to CPU.
+        if self.device == "cuda" and not ct2_supports_gpu():
             logger.warning(
-                "AMD GPU detected with ROCm PyTorch, but faster-whisper/ctranslate2 "
-                "has no ROCm backend. Using CPU mode. "
-                "For GPU acceleration on AMD, use --asr openai_whisper instead."
+                "GPU detected, but the installed ctranslate2/faster-whisper build "
+                "cannot use it. Using CPU mode. "
+                "For GPU acceleration on AMD, install a ROCm ctranslate2 build."
             )
             self.device = "cpu"
 

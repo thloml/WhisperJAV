@@ -126,6 +126,23 @@ def is_rocm_build() -> bool:
         return False
 
 
+def ct2_supports_gpu() -> bool:
+    """
+    Check if the installed ctranslate2 (faster-whisper backend) can use the GPU.
+
+    CTranslate2 builds (CUDA or ROCm/HIP) report available devices via
+    get_cuda_device_count(); CPU-only builds report 0.
+
+    Returns:
+        True if ctranslate2 can run on the current GPU, False otherwise
+    """
+    try:
+        import ctranslate2
+        return ctranslate2.get_cuda_device_count() > 0
+    except ImportError:
+        return False
+
+
 def get_best_device(prefer_cpu: bool = False) -> str:
     """
     Auto-detect and return the best available compute device.
@@ -136,8 +153,8 @@ def get_best_device(prefer_cpu: bool = False) -> str:
     3. CPU (fallback or explicit preference)
 
     Note: On ROCm builds, "cuda" is returned for torch-based pipelines.
-    CTranslate2 (faster-whisper) has no ROCm backend, so those callers
-    should use get_ctranslate2_device() instead.
+    CTranslate2 (faster-whisper) supports the GPU only when built with a
+    ROCm backend, so those callers should use get_ctranslate2_device().
 
     Args:
         prefer_cpu: Force CPU mode even if GPU available
@@ -182,24 +199,25 @@ def get_ctranslate2_device(prefer_cpu: bool = False) -> str:
     """
     Return a device string that is safe for CTranslate2 (faster-whisper).
 
-    CTranslate2 only supports "cuda" (NVIDIA) and "cpu". On AMD ROCm builds
-    of PyTorch, passing "cuda" to faster-whisper would fail because
-    CTranslate2 has no ROCm backend, so it falls back to CPU. Torch-based
-    pipelines (openai_whisper, stable_ts, transformers) can still use the
-    AMD GPU via get_best_device().
+    CTranslate2 only supports "cuda" and "cpu". The GPU is usable only when
+    the installed ctranslate2 build supports it: CUDA builds on NVIDIA, or
+    ROCm/HIP builds on AMD. CPU-only builds (or a CUDA build on an AMD-only
+    machine) fall back to CPU. Torch-based pipelines (openai_whisper,
+    stable_ts, transformers) can still use the GPU via get_best_device().
 
     Args:
         prefer_cpu: Force CPU mode even if GPU available
 
     Returns:
-        Device string: "cuda" (NVIDIA only) or "cpu"
+        Device string: "cuda" (when supported) or "cpu"
     """
     device = get_best_device(prefer_cpu)
-    if device == "cuda" and is_rocm_build():
+    if device == "cuda" and not ct2_supports_gpu():
         logger.warning(
-            "AMD GPU detected with ROCm PyTorch, but faster-whisper/ctranslate2 "
-            "has no ROCm backend. Running the CTranslate2 pipeline on CPU. "
-            "For GPU-accelerated transcription on AMD, use --asr openai_whisper "
+            "GPU detected, but the installed ctranslate2/faster-whisper build "
+            "cannot use it (CPU-only build, or no CUDA/ROCm backend for this GPU). "
+            "Running the CTranslate2 pipeline on CPU. "
+            "For GPU-accelerated transcription, use --asr openai_whisper "
             "(or stable_ts)."
         )
         return "cpu"
