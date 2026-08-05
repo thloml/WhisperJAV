@@ -149,3 +149,6 @@ WhisperJAV.bat
 
 
 
+
+# Runtime build artifacts (ctranslate2 ROCm backend, source checkouts)
+.runtime/

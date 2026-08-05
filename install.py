@@ -19,6 +19,8 @@ Usage:
 Options:
     --cpu-only              Install CPU-only PyTorch (no CUDA)
     --cuda VERSION          Install PyTorch for specific CUDA version (e.g. cu118, cu124, cu128)
+    --rocm                  AMD GPU: install PyTorch ROCm wheels and build
+                            ctranslate2 from source with the HIP backend
     --no-speech-enhancement Skip speech enhancement packages
     --minimal               Minimal install (transcription only)
     --dev                   Install in development/editable mode
@@ -39,6 +41,7 @@ Examples:
 """
 
 import os
+import re
 import sys
 import argparse
 import shutil
@@ -58,6 +61,7 @@ PYTORCH_INDEXES = {
     "cu118": "https://download.pytorch.org/whl/cu118",
     "cu124": "https://download.pytorch.org/whl/cu124",
     "cu128": "https://download.pytorch.org/whl/cu128",
+    "rocm7.1": "https://download.pytorch.org/whl/rocm7.1",
 }
 
 # =============================================================================
@@ -451,6 +455,52 @@ def detect_cuda_version(args) -> str:
     return "cpu"
 
 
+def detect_amd_rocm() -> bool:
+    """Detect an AMD GPU with the ROCm toolkit installed.
+
+    Returns True when rocm-smi/hipcc is on PATH or lspci shows an AMD
+    Radeon GPU — used to decide whether to build the ctranslate2 ROCm
+    backend automatically.
+    """
+    import subprocess
+
+    for tool in ("rocm-smi", "hipcc"):
+        if shutil.which(tool):
+            log(f"  ROCm toolkit detected: {tool}")
+            return True
+    try:
+        result = subprocess.run(
+            ["lspci"], capture_output=True, text=True, timeout=10
+        )
+        if re.search(r"VGA.*(AMD|ATI|Radeon)|Advanced Micro Devices.*VGA", result.stdout, re.I):
+            log("  AMD GPU detected via lspci")
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def run_ct2_rocm_build(venv_dir: str) -> bool:
+    """Build the ctranslate2 ROCm backend (scripts/build_ct2_rocm.sh)."""
+    import subprocess
+
+    script = _source_dir / "scripts" / "build_ct2_rocm.sh"
+    if not script.exists():
+        log("    [ERROR] scripts/build_ct2_rocm.sh not found")
+        return False
+    cmd = ["bash", str(script), "--venv", venv_dir]
+    log(f"\n>>> {' '.join(cmd)}")
+    try:
+        result = subprocess.run(cmd, cwd=str(_source_dir), timeout=3600)
+        return result.returncode == 0
+    except subprocess.TimeoutExpired:
+        log("    [ERROR] ctranslate2 ROCm build timed out after 60 minutes")
+        return False
+    except Exception as e:
+        log(f"    [ERROR] ctranslate2 ROCm build failed: {e}")
+        return False
+
+
 # =============================================================================
 # uv sync wrapper
 # =============================================================================
@@ -790,6 +840,13 @@ def main():
                         help="Install CPU-only PyTorch")
     parser.add_argument("--cuda", type=str, default=None, metavar="VERSION",
                         help="CUDA version (e.g. cu118, cu124, cu128)")
+    parser.add_argument("--rocm", action="store_true",
+                        help="AMD GPU support: install PyTorch ROCm wheels and build "
+                             "ctranslate2 from source with the HIP backend. "
+                             "AMD GPUs are detected automatically and a hint is shown; pass --rocm to enable.")
+    parser.add_argument("--no-rocm", action="store_true",
+                        help="Skip AMD GPU setup (ROCm torch index + ctranslate2 build) "
+                             "even if an AMD GPU is detected")
     parser.add_argument("--no-speech-enhancement", action="store_true",
                         help="Skip speech enhancement packages")
     parser.add_argument("--minimal", action="store_true",
@@ -871,6 +928,28 @@ def main():
     log_section("GPU Detection")
     cuda_version = detect_cuda_version(args)
 
+    # AMD ROCm: swap the PyTorch index to ROCm wheels and build the
+    # ctranslate2 HIP backend after uv sync. Only explicit --rocm enables
+    # this — auto-detection just suggests it, because switching to the
+    # ROCm index makes uv re-download the multi-GB torch wheels even when
+    # a working ROCm torch is already installed manually.
+    use_rocm = args.rocm
+    if use_rocm:
+        if args.cuda:
+            log("  [WARN] --rocm ignored because --cuda was given explicitly")
+            use_rocm = False
+        else:
+            log("  --rocm specified — using the PyTorch ROCm index and building "
+                "ctranslate2 with the ROCm backend.")
+    elif not args.no_rocm and not args.cpu_only and cuda_version == "cpu":
+        log("  Checking for AMD GPU + ROCm toolkit...")
+        if detect_amd_rocm():
+            log("  AMD GPU detected, but ROCm setup is opt-in: re-run with "
+                "--rocm to install ROCm torch wheels and build the ctranslate2 "
+                "ROCm backend. (Skip this check with --no-rocm)")
+    if use_rocm:
+        cuda_version = "rocm7.1"
+
     # -------------------------------------------------------------------------
     # Determine extras
     # -------------------------------------------------------------------------
@@ -920,6 +999,28 @@ def main():
         log("    INSTALLATION FAILED")
         create_failure_file("uv sync failed — check install_log.txt for details")
         sys.exit(1)
+
+    # -------------------------------------------------------------------------
+    # ctranslate2 ROCm backend (AMD GPU support) — torch already came from
+    # the ROCm index via uv sync above.
+    # -------------------------------------------------------------------------
+    if use_rocm:
+        log_section("ctranslate2 ROCm Backend")
+        venv_python = _venv_python(target_env)
+        venv_dir = str(Path(venv_python).parent.parent)
+        log(f"  Target venv: {venv_dir}")
+        log("  This compiles ctranslate2 from source and takes 10-20 minutes.")
+        rocm_ok = run_ct2_rocm_build(venv_dir)
+        if rocm_ok:
+            log("    [OK] ctranslate2 ROCm backend installed — AMD GPU transcription enabled.")
+        elif args.rocm:
+            log("")
+            log("    INSTALLATION FAILED (ctranslate2 ROCm build)")
+            create_failure_file("ctranslate2 ROCm build failed — see script output above")
+            sys.exit(1)
+        else:
+            log("    [WARN] ctranslate2 ROCm build failed — WhisperJAV will "
+                "fall back to CPU transcription.")
 
     # -------------------------------------------------------------------------
     # Local LLM (llama-cpp-python) — handled separately

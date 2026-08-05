@@ -70,6 +70,9 @@ dependencies = [
     "openai-whisper @ git+https://github.com/openai/whisper@main",
     "stable-ts @ git+https://github.com/meizhong986/stable-ts-fix-setup.git@main",
     "faster-whisper>=1.1.0",
+    # Pinned to match the source-built ROCm fork (scripts/build_ct2_rocm.sh);
+    # keeps `uv sync` from replacing the AMD GPU build with a CPU wheel.
+    "ctranslate2==4.6.2",
 
     # Audio/video handling
     "ffmpeg-python @ git+https://github.com/kkroening/ffmpeg-python.git",
