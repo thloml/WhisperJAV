@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """V3 Architectur. Fidelity pipeline implementation - scene detection with WhisperPro ASR."""
 
-import shutil 
+import shutil
+import sys 
 from pathlib import Path
 from typing import Dict, List
 import time
@@ -207,11 +208,6 @@ class FidelityPipeline(BasePipeline):
             # created, used, and DESTROYED before ASR loads (VRAM Sandwich prevention).
             # =================================================================
             import gc
-            try:
-                import torch
-                _torch_available = torch.cuda.is_available()
-            except ImportError:
-                _torch_available = False
 
             self.progress.set_current_step("Preparing audio for ASR", 3, 6)
 
@@ -224,6 +220,20 @@ class FidelityPipeline(BasePipeline):
                 enhancer_name = "none"
                 enhancer_display = "None (passthrough)"
             else:
+                # NOTE: torch.cuda.is_available() is deliberately called ONLY
+                # here. On ROCm builds initializing torch's HIP context before
+                # the ctranslate2 model exists poisons ct2's host memory pool
+                # (RAM leak per transcribe call — see get_ct2_gpu_device in
+                # utils/device_detector.py). The ASR model loads AFTER this
+                # block; the enhancer is torch-based, so the check belongs in
+                # this branch. A torch-based enhancer followed by a ct2 ASR on
+                # AMD still poisons ct2 (known limitation, see comment there).
+                try:
+                    import torch
+                    _torch_available = torch.cuda.is_available()
+                except ImportError:
+                    _torch_available = False
+
                 # A. Load Enhancer (always succeeds - "none" backend is fallback)
                 enhancer = create_enhancer_from_config(self._enhancer_config)
                 enhancer_name = enhancer.name
@@ -260,115 +270,157 @@ class FidelityPipeline(BasePipeline):
             }
 
             # =================================================================
-            # PHASE 2: ASR TRANSCRIPTION (Exclusive VRAM Block)
-            # ASR is a LOCAL variable - created after enhancer is destroyed,
-            # and destroyed before function returns.
+            # PHASE 2: ASR TRANSCRIPTION (Subprocess Scene Batches)
+            # Scenes are transcribed by short-lived worker subprocesses
+            # (whisperjav.modules.scene_batch_worker). The community
+            # ctranslate2 ROCm build leaks host RAM per transcribe() call in
+            # long-lived processes (~60MB/scene, native) — a long video OOMs
+            # the machine. Each worker process dies with its leaked memory,
+            # bounding total RAM to BATCH_SCENES * leak_rate.
             # =================================================================
 
-            # A. Load ONLY the ASR (LOCAL variable, not self.asr)
-            logger.info("Initializing ASR model (exclusive VRAM block)")
-            asr = WhisperProASR(**self._asr_config)
-
-            # Reset statistics after ASR is initialized
-            if hasattr(asr, "reset_statistics"):
-                asr.reset_statistics()
+            logger.info("Initializing ASR model (subprocess workers)")
 
             # Step 4: Transcribe scenes
             if self.progress_reporter:
                 self.progress_reporter.report_step("Transcribing scenes with VAD", 4, 6)
             self.progress.set_current_step("Transcribing scenes with VAD", 4, 6)
-            
+
             scene_srts_dir = self.temp_dir / "scene_srts"
             scene_srts_dir.mkdir(exist_ok=True)
             scene_srt_info = []
-            
+
             # Start scene transcription with unified progress management
             self.progress.start_subtask("Transcribing scenes", len(scene_paths))
-            
-            # Check if we have access to unified progress manager for external library suppression
-            unified_manager = getattr(self.progress, 'unified_manager', None)
-            
+
             # Scene-level progress tracking variables
             last_update_time = time.time()
             transcription_start_time = time.time()
             update_interval = 30  # seconds
-            batch_update_size = 5  # scenes
             total_scenes = len(scene_paths)
-            
+            BATCH_SCENES = 50
+
             # Print initial scene transcription header (always visible)
             print(f"\nTranscribing {total_scenes} scenes with VAD-enhanced processing:")
-            
-            for idx, (scene_path, start_time_sec, _, _) in enumerate(scene_paths):
-                scene_srt_path = scene_srts_dir / f"{scene_path.stem}.srt"
-                scene_num = idx + 1
-                
-                # Show scene-level progress for user feedback (bypass adapter filtering)
+
+            logprob_filtered = 0
+            nonverbal_filtered = 0
+
+            import json as _json
+            import subprocess as _subprocess
+
+            # JSON-serializable ASR config for the workers
+            asr_cfg = {
+                "model": dict(self._asr_config["model_config"]),
+                "params": self._asr_config["params"],
+                "asr_class": "whisper_pro",
+            }
+
+            batches = [
+                scene_paths[i:i + BATCH_SCENES]
+                for i in range(0, total_scenes, BATCH_SCENES)
+            ]
+            done = 0
+            for bi, batch in enumerate(batches):
+                batch_items = [
+                    (idx, sp, st)
+                    for idx, (sp, st, _, _) in enumerate(scene_paths)
+                    if any(sp == b[0] for b in batch)
+                ]
+                batch_map = {str(sp): (idx, sp, st) for idx, sp, st in batch_items}
+
+                batch_path = scene_srts_dir / f"batch_{bi:04d}.json"
+                cfg_path = scene_srts_dir / f"batch_{bi:04d}.cfg.json"
+                results_path = scene_srts_dir / f"batch_{bi:04d}.results.json"
+                batch_path.write_text(
+                    _json.dumps([str(sp) for _, sp, _ in batch_items]), encoding="utf-8")
+                cfg_path.write_text(_json.dumps(asr_cfg, default=str), encoding="utf-8")
+                if results_path.exists():
+                    results_path.unlink()
+
+                try:
+                    _subprocess.run(
+                        [sys.executable, "-m", "whisperjav.modules.scene_batch_worker",
+                         str(batch_path), str(scene_srts_dir), self.asr_task, str(cfg_path)],
+                        timeout=3600,
+                        check=False,
+                    )
+                except Exception as e:
+                    logger.error(f"Scene batch {bi} failed to run: {e}")
+
+                results = []
+                if results_path.exists():
+                    try:
+                        results = _json.loads(results_path.read_text(encoding="utf-8"))
+                    except Exception as e:
+                        logger.error(f"Failed to read batch results {results_path}: {e}")
+
+                for item in results:
+                    scene = item.get("scene")
+                    if scene not in batch_map:
+                        continue
+                    idx, scene_path, start_time_sec = batch_map[scene]
+                    scene_num = idx + 1
+
+                    fstats = item.get("filter_stats", {}) or {}
+                    logprob_filtered += fstats.get('logprob_filtered', 0)
+                    nonverbal_filtered += fstats.get('nonverbal_filtered', 0)
+
+                    if item.get("ok"):
+                        srt_path = Path(item["srt"])
+                        if srt_path.exists() and srt_path.stat().st_size > 0:
+                            scene_srt_info.append((srt_path, start_time_sec))
+                            master_metadata["scenes_detected"][idx]["transcribed"] = True
+                            master_metadata["scenes_detected"][idx]["srt_path"] = str(srt_path)
+                        else:
+                            master_metadata["scenes_detected"][idx]["transcribed"] = True
+                            master_metadata["scenes_detected"][idx]["no_speech_detected"] = True
+                    else:
+                        master_metadata["scenes_detected"][idx]["transcribed"] = False
+                        master_metadata["scenes_detected"][idx]["error"] = item.get("error", "unknown")
+                        self.progress.show_message(
+                            f"Scene {scene_num}/{total_scenes} failed: {item.get('error', '')}",
+                            "error", 2.0)
+
+                    done += 1
+                    self.progress.update_subtask(1)
+
+                # Mark any scenes the worker did not report as failed
+                reported = {item.get("scene") for item in results}
+                for idx, scene_path, _ in batch_items:
+                    if str(scene_path) not in reported:
+                        master_metadata["scenes_detected"][idx]["transcribed"] = False
+                        master_metadata["scenes_detected"][idx]["error"] = "worker did not report scene"
+                        self.progress.update_subtask(1)
+                        done += 1
+
+                # Show batch-level progress
                 should_show_update = (
-                    scene_num == 1 or  # Always show first scene
-                    scene_num % batch_update_size == 0 or  # Every 5 scenes
-                    time.time() - last_update_time > update_interval or  # Every 30 seconds
-                    scene_num == len(scene_paths)  # Always show last scene
+                    done == total_scenes or
+                    bi == 0 or
+                    time.time() - last_update_time > update_interval
                 )
-                
                 if should_show_update:
-                    # Create tqdm-style progress bar (ASCII-compatible for Windows)
-                    progress_pct = (scene_num / total_scenes) * 100
+                    progress_pct = (done / total_scenes) * 100
                     bar_width = 30
-                    filled_width = int(bar_width * scene_num / total_scenes)
+                    filled_width = int(bar_width * done / total_scenes)
                     progress_bar = '=' * filled_width + '-' * (bar_width - filled_width)
-                    
-                    # Calculate ETA (only after processing a few scenes)
                     eta_text = ""
-                    if scene_num > 3:
+                    if done > 3:
                         elapsed = time.time() - transcription_start_time
-                        avg_time_per_scene = elapsed / scene_num
-                        remaining_scenes = total_scenes - scene_num
+                        avg_time_per_scene = elapsed / done
+                        remaining_scenes = total_scenes - done
                         eta_seconds = remaining_scenes * avg_time_per_scene
-                        
                         if eta_seconds > 60:
                             eta_text = f" | ETA: {eta_seconds/60:.1f}m"
                         else:
                             eta_text = f" | ETA: {eta_seconds:.0f}s"
-                    
-                    # Format scene filename (truncate if needed)
-                    scene_filename = scene_path.name
-                    if len(scene_filename) > 25:
-                        scene_filename = scene_filename[:22] + "..."
-                    
-                    # Direct console output (bypasses adapter filtering)
-                    progress_line = f"\rTranscribing: [{progress_bar}] {scene_num}/{total_scenes} [{progress_pct:.1f}%] | {scene_filename}{eta_text}"
-                    print(progress_line, end='', flush=True)
-                    
+                    print(f"\rTranscribing: [{progress_bar}] {done}/{total_scenes} [{progress_pct:.1f}%]{eta_text}",
+                          end='', flush=True)
                     last_update_time = time.time()
-                
-                try:
-                    # Use unified progress manager's external suppression if available
-                    if unified_manager:
-                        with unified_manager.suppress_external_progress():
-                            asr.transcribe_to_srt(scene_path, scene_srt_path, task=self.asr_task)
-                    else:
-                        asr.transcribe_to_srt(scene_path, scene_srt_path, task=self.asr_task)
-                    
-                    # Process results - simplified to reduce message spam
-                    if scene_srt_path.exists() and scene_srt_path.stat().st_size > 0:
-                        scene_srt_info.append((scene_srt_path, start_time_sec))
-                        master_metadata["scenes_detected"][idx]["transcribed"] = True
-                        master_metadata["scenes_detected"][idx]["srt_path"] = str(scene_srt_path)
-                    else:
-                        master_metadata["scenes_detected"][idx]["transcribed"] = True
-                        master_metadata["scenes_detected"][idx]["no_speech_detected"] = True
-                        
-                    self.progress.update_subtask(1)
-                    
-                except Exception as e:
-                    # Show errors with scene context
-                    self.progress.show_message(f"Scene {scene_num}/{len(scene_paths)} failed: {str(e)}", "error", 2.0)
-                    master_metadata["scenes_detected"][idx]["transcribed"] = False
-                    master_metadata["scenes_detected"][idx]["error"] = str(e)
-                    self.progress.update_subtask(1)
-            
+
             self.progress.finish_subtask()
-            
+
             # Print completion message for scene transcription (always visible)
             print(f"\n[DONE] Completed transcription of {total_scenes} scenes")
             
@@ -425,22 +477,11 @@ class FidelityPipeline(BasePipeline):
                 "empty_removed": stats.get('empty_removed', 0)
             }
 
-            logprob_filtered = 0
-            nonverbal_filtered = 0
-            if hasattr(asr, "get_filter_statistics"):
-                filter_stats = asr.get_filter_statistics() or {}
-                logprob_filtered = filter_stats.get('logprob_filtered', 0)
-                nonverbal_filtered = filter_stats.get('nonverbal_filtered', 0)
-
-            # C. DESTROY ASR - Trigger C++ destructor while interpreter is STABLE
-            # This prevents the "Zone of Death" crash during Python shutdown
-            logger.debug("Destroying ASR to free VRAM and trigger safe destructor")
-            asr.cleanup()
-            del asr
-            gc.collect()
-            if _torch_available:
-                torch.cuda.empty_cache()
-                logger.debug("GPU memory cleared after ASR - VRAM should be near-zero")
+            # C. ASR CLEANUP: n/a — transcription ran in worker subprocesses
+            # (scene_batch_worker) which exit via os._exit(0); their memory,
+            # including the ctranslate2 ROCm host-RAM leak, is reclaimed by
+            # the OS. Nothing to clean up in this process.
+            logger.debug("ASR cleanup skipped (subprocess workers already exited)")
 
             master_metadata["summary"]["final_subtitles_raw"] += logprob_filtered + nonverbal_filtered
             master_metadata["summary"]["quality_metrics"].update({

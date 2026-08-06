@@ -22,7 +22,7 @@ import torch
 from faster_whisper import WhisperModel
 
 from whisperjav.utils.logger import logger
-from whisperjav.utils.device_detector import get_best_device, ct2_supports_gpu
+from whisperjav.utils.device_detector import get_ct2_gpu_device
 
 
 class KotobaFasterWhisperASR:
@@ -51,7 +51,12 @@ class KotobaFasterWhisperASR:
         """
         # Model configuration
         self.model_name = model_config.get("model_name", self.DEFAULT_MODEL)
-        self.device = model_config.get("device", get_best_device())
+        # Optimistic device choice for ct2 — NEVER query ctranslate2 or torch
+        # before the model is created: on ROCm builds that poisons ct2's HIP
+        # host memory pool and leaks RAM per transcribe() call. If "cuda"
+        # fails to load (e.g. CPU-only ct2 build), _initialize_model() falls
+        # back to CPU.
+        self.device = model_config.get("device", get_ct2_gpu_device())
 
         # CTRANSLATE2 COMPATIBILITY: MPS is not supported by ctranslate2/faster-whisper
         # CTranslate2 only supports "cuda" or "cpu" devices.
@@ -61,17 +66,6 @@ class KotobaFasterWhisperASR:
                 "Apple Silicon MPS detected, but faster-whisper/ctranslate2 doesn't support MPS. "
                 "Using CPU mode with Apple Accelerate optimization. "
                 "For GPU acceleration on Mac, use --mode transformers instead."
-            )
-            self.device = "cpu"
-
-        # CTRANSLATE2 COMPATIBILITY: GPU requires a matching ctranslate2 build
-        # (CUDA for NVIDIA, ROCm/HIP for AMD). If the installed build cannot
-        # use the GPU (e.g. CPU-only ctranslate2), fall back to CPU.
-        if self.device == "cuda" and not ct2_supports_gpu():
-            logger.warning(
-                "GPU detected, but the installed ctranslate2/faster-whisper build "
-                "cannot use it. Using CPU mode. "
-                "For GPU acceleration on AMD, install a ROCm ctranslate2 build."
             )
             self.device = "cpu"
 
@@ -198,6 +192,29 @@ class KotobaFasterWhisperASR:
                     except Exception as fallback_e:
                         logger.error(f"int8 fallback also failed: {fallback_e}")
                         raise fallback_e
+
+                # Any other failure on CUDA (e.g. CPU-only ctranslate2 build)
+                # — retry on CPU (device was chosen optimistically).
+                logger.warning(
+                    f"Kotoba failed to load on device '{self.device}': {e}. "
+                    "Falling back to CPU mode."
+                )
+                try:
+                    self.model = WhisperModel(
+                        model_size_or_path=self.model_name,
+                        device="cpu",
+                        compute_type="auto",
+                        download_root=None,
+                        cpu_threads=0,
+                        num_workers=1,
+                    )
+                    self.device = "cpu"
+                    self.compute_type = "auto"
+                    logger.info("Kotoba model loaded successfully with CPU fallback")
+                    return
+                except Exception as cpu_e:
+                    logger.error(f"CPU fallback also failed: {cpu_e}")
+                    raise cpu_e
 
             logger.error(f"Failed to load Kotoba model: {e}")
             raise

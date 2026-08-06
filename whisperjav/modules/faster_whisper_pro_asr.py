@@ -20,7 +20,7 @@ import traceback
 import logging
 
 from whisperjav.utils.logger import logger
-from whisperjav.utils.device_detector import get_best_device, ct2_supports_gpu
+from whisperjav.utils.device_detector import get_ct2_gpu_device
 from whisperjav.utils.parameter_tracer import NullTracer
 from whisperjav.utils.crash_tracer import get_tracer
 from whisperjav.modules.segment_filters import SegmentFilterConfig, SegmentFilterHelper
@@ -45,8 +45,12 @@ class FasterWhisperProASR:
         self.tracer = tracer if tracer is not None else NullTracer()
         # --- V3 PARAMETER UNPACKING ---
         self.model_name = model_config.get("model_name", "large-v2")
-        # Use smart device detection: CUDA -> MPS -> CPU
-        self.device = model_config.get("device", get_best_device())
+        # Optimistic device choice for ct2 — NEVER query ctranslate2 or torch
+        # before the model is created: on ROCm builds that poisons ct2's HIP
+        # host memory pool and leaks RAM per transcribe() call. If "cuda"
+        # fails to load (e.g. CPU-only ct2 build), _initialize_models() falls
+        # back to CPU.
+        self.device = model_config.get("device", get_ct2_gpu_device())
 
         # CTRANSLATE2 COMPATIBILITY: MPS is not supported by ctranslate2/faster-whisper
         # CTranslate2 only supports "cuda" or "cpu" devices.
@@ -57,17 +61,6 @@ class FasterWhisperProASR:
                 "Apple Silicon MPS detected, but faster-whisper/ctranslate2 doesn't support MPS. "
                 "Using CPU mode with Apple Accelerate optimization. "
                 "For GPU acceleration on Mac, use --mode transformers instead."
-            )
-            self.device = "cpu"
-
-        # CTRANSLATE2 COMPATIBILITY: GPU requires a matching ctranslate2 build
-        # (CUDA for NVIDIA, ROCm/HIP for AMD). If the installed build cannot
-        # use the GPU (e.g. CPU-only ctranslate2), fall back to CPU.
-        if self.device == "cuda" and not ct2_supports_gpu():
-            logger.warning(
-                "GPU detected, but the installed ctranslate2/faster-whisper build "
-                "cannot use it. Using CPU mode. "
-                "For GPU acceleration on AMD, install a ROCm ctranslate2 build."
             )
             self.device = "cpu"
 
@@ -88,6 +81,24 @@ class FasterWhisperProASR:
                 "Falling back to 'auto' (CTranslate2 will select optimal CPU type)."
             )
             self.compute_type = "auto"
+
+        # ROCm/HIP: float16-family compute types leak host RAM per transcribe
+        # call on the community ctranslate2 ROCm build (verified on gfx1201).
+        # The resolver picks float32 automatically; warn if the user forced a
+        # leaking type explicitly.
+        if self.device == "cuda" and self.compute_type in (
+            "float16", "int8_float16", "int8_bfloat16", "bfloat16",
+        ):
+            try:
+                import torch
+                if getattr(torch.version, "hip", None):
+                    logger.warning(
+                        f"Compute type '{self.compute_type}' leaks host memory on "
+                        "ROCm ctranslate2 builds (RAM grows per transcription, "
+                        "can OOM long videos). Use --compute-type float32 or int8."
+                    )
+            except ImportError:
+                pass
 
         decoder_params = params["decoder"]
         vad_params = params["vad"]
@@ -268,8 +279,10 @@ class FasterWhisperProASR:
             )
             logger.debug(f"Model type: {type(self.whisper_model)}")
         except Exception as e:
-            # VRAM exhaustion fallback - try int8 if float16/other fails on CUDA
-            if self.device == "cuda" and self.compute_type != "int8":
+            # NOTE: cuda load failures fall back to CPU — device was chosen
+            # optimistically (see __init__) because querying ctranslate2/torch
+            # before model creation poisons the ROCm build's host memory pool.
+            if self.device == "cuda":
                 vram_error_indicators = [
                     "out of memory",
                     "cuda out of memory",
@@ -279,17 +292,18 @@ class FasterWhisperProASR:
                     "insufficient memory",
                 ]
                 error_str = str(e).lower()
-                if any(indicator in error_str for indicator in vram_error_indicators):
+                if self.compute_type != "int8" and any(
+                    indicator in error_str for indicator in vram_error_indicators
+                ):
+                    # VRAM exhaustion — retry int8 on the GPU first
                     logger.warning(
                         f"CUDA {self.compute_type} failed (likely VRAM exhaustion): {e}. "
                         "Falling back to int8 compute type."
                     )
                     try:
-                        # Clear CUDA cache before retry
                         if torch.cuda.is_available():
                             torch.cuda.empty_cache()
                             gc.collect()
-
                         self.whisper_model = WhisperModel(
                             model_size_or_path=self.model_name,
                             device=self.device,
@@ -297,12 +311,34 @@ class FasterWhisperProASR:
                             cpu_threads=0,
                             num_workers=1,
                         )
-                        self.compute_type = "int8"  # Update for logging/metadata
+                        self.compute_type = "int8"
                         logger.info("Faster-Whisper model loaded successfully with int8 fallback")
                         return
                     except Exception as fallback_e:
                         logger.error(f"int8 fallback also failed: {fallback_e}")
-                        raise fallback_e
+                        e = fallback_e
+
+                # Any other failure on CUDA (e.g. CPU-only ctranslate2 build,
+                # missing CUDA/HIP driver) — retry on CPU.
+                logger.warning(
+                    f"Faster-Whisper failed to load on device '{self.device}': {e}. "
+                    "Falling back to CPU mode."
+                )
+                try:
+                    self.whisper_model = WhisperModel(
+                        model_size_or_path=self.model_name,
+                        device="cpu",
+                        compute_type="auto",
+                        cpu_threads=0,
+                        num_workers=1,
+                    )
+                    self.device = "cpu"
+                    self.compute_type = "auto"
+                    logger.info("Faster-Whisper model loaded successfully with CPU fallback")
+                    return
+                except Exception as cpu_e:
+                    logger.error(f"CPU fallback also failed: {cpu_e}")
+                    raise cpu_e
 
             logger.error(f"Failed to load Faster-Whisper model: {e}", exc_info=True)
             logger.error(f"Model name that failed: {self.model_name}")

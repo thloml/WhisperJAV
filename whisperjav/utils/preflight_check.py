@@ -582,6 +582,14 @@ def enforce_gpu_requirement(accept_cpu_mode=False, timeout_seconds=30):
     try:
         import torch
 
+        # ROCm builds: the GPU exists (torch.version.hip is set). Do NOT call
+        # torch.cuda.* here — initializing torch's HIP context breaks the
+        # ctranslate2 backend's host memory handling (RAM leak / native crash
+        # on AMD; see crash_tracer note). get_best_device() below would do
+        # exactly that.
+        if getattr(torch.version, "hip", None):
+            return True
+
         # Check for any GPU (CUDA or MPS)
         best_device = get_best_device()
         if best_device in ('cuda', 'mps'):

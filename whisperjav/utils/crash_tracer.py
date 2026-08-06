@@ -26,6 +26,8 @@ import signal
 import atexit
 import threading
 import traceback
+
+from whisperjav.utils.device_detector import is_rocm_build
 from pathlib import Path
 from datetime import datetime
 from typing import Any, Dict, Optional
@@ -65,10 +67,18 @@ class CrashTracer:
         self.last_audio_info = None
 
         # GPU state tracking
+        # NOTE: torch.cuda.is_available() must NOT be called here. On ROCm
+        # builds, initializing torch's HIP context (even after the ctranslate2
+        # model exists) breaks ct2's host memory handling — per-inference RAM
+        # leak before the model, native crash after it. is_initialized() is
+        # safe: it never creates the context.
         self.gpu_available = False
         try:
             import torch
-            self.gpu_available = torch.cuda.is_available()
+            if is_rocm_build():
+                self.gpu_available = torch.cuda.is_initialized()
+            else:
+                self.gpu_available = torch.cuda.is_available()
         except ImportError:
             pass
 

@@ -258,24 +258,44 @@ class WhisperVadSpeechSegmenter:
                 "Install: pip install faster-whisper"
             )
 
-        # Determine device
+        # Determine device — optimistic "cuda": querying ctranslate2 or torch
+        # before model creation poisons the ROCm build's host memory pool
+        # (RAM leak per transcribe call). Fall back to CPU on load failure.
         device = self.device
         if device == "auto":
-            import torch
-            from whisperjav.utils.device_detector import ct2_supports_gpu
-            if torch.cuda.is_available() and ct2_supports_gpu():
-                device = "cuda"
-            else:
-                device = "cpu"
+            device = "cuda"
             logger.info(f"[WhisperVAD] Auto-detected device: {device}")
 
         # Note: compute_type="auto" (default) lets CTranslate2 handle device-specific selection
         # See: https://github.com/OpenNMT/CTranslate2/issues/1865
-        self._model = WhisperModel(
-            self._model_size,
-            device=device,
-            compute_type=self.compute_type,
-        )
+        # ROCm/HIP: float16-family types leak host RAM per transcribe call on
+        # the community ctranslate2 ROCm build — force float32 there.
+        try:
+            import torch
+            if getattr(torch.version, "hip", None) and self.compute_type == "auto":
+                self.compute_type = "float32"
+        except ImportError:
+            pass
+        try:
+            self._model = WhisperModel(
+                self._model_size,
+                device=device,
+                compute_type=self.compute_type,
+            )
+        except Exception as e:
+            if device == "cuda":
+                logger.warning(
+                    f"[WhisperVAD] Failed to load on CUDA: {e}. Falling back to CPU."
+                )
+                self._model = WhisperModel(
+                    self._model_size,
+                    device="cpu",
+                    compute_type="auto",
+                )
+                device = "cpu"
+                logger.info("[WhisperVAD] Model loaded successfully on cpu (fallback)")
+            else:
+                raise
         logger.info(f"[WhisperVAD] Model loaded successfully on {device}")
 
     def _transcribe(self, audio_path: Path) -> Tuple[List[Dict], Dict]:

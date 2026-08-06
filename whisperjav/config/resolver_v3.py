@@ -23,7 +23,7 @@ from .components import (
     get_vad_registry,
     get_feature_registry,
 )
-from whisperjav.utils.device_detector import get_best_device
+from whisperjav.utils.device_detector import get_best_device, get_ct2_gpu_device, is_rocm_build
 
 logger = logging.getLogger("whisperjav")
 
@@ -50,6 +50,11 @@ def _is_pascal_gpu() -> bool:
     Returns:
         True if Pascal GPU detected, False otherwise
     """
+    # ROCm builds: skip — torch.cuda.* here would initialize the HIP context
+    # BEFORE the ctranslate2 model exists, which poisons ct2's host memory
+    # pool and leaks RAM per transcribe call. Pascal is NVIDIA-only anyway.
+    if is_rocm_build():
+        return False
     try:
         import torch
         if not torch.cuda.is_available():
@@ -105,6 +110,12 @@ def _is_blackwell_gpu() -> bool:
     Returns:
         True if Blackwell GPU detected, False otherwise
     """
+    # ROCm builds: skip — torch.cuda.* here would initialize the HIP context
+    # BEFORE the ctranslate2 model exists, which poisons ct2's host memory
+    # pool and leaks RAM per transcribe call. Blackwell is NVIDIA-only anyway;
+    # on ROCm the default float16 compute_type is already correct.
+    if is_rocm_build():
+        return False
     try:
         import torch
         if not torch.cuda.is_available():
@@ -168,6 +179,20 @@ def _get_compute_type_for_device(device: str, provider: str) -> str:
             return "auto"
 
         # --- CUDA devices below ---
+
+        # ROCm/HIP (AMD): float16 and the mixed-precision types (int8_float16,
+        # int8_bfloat16, bfloat16) leak host RAM per transcribe() call on the
+        # community ROCm ctranslate2 build (verified on gfx1201: 40-150MB per
+        # call, unbounded — a 4.6h video OOMs a 48GB machine). float32 and
+        # int8 are leak-free. This check must come before the NVIDIA-specific
+        # Pascal/Blackwell branches (which would misdetect AMD anyway).
+        if is_rocm_build():
+            logger.info(
+                "ROCm build detected: using float32 compute_type. "
+                "float16/mixed-precision types leak host memory on the HIP "
+                "ctranslate2 build; use --compute-type int8 for more speed."
+            )
+            return "float32"
 
         # Pascal workaround (sm_6x): Pascal GPUs (GTX 10xx, Quadro Pxxx) are
         # reported to not support efficient float16 in CTranslate2.
@@ -328,7 +353,14 @@ def resolve_config_v3(
         selected_device = device
         logger.debug(f"v3.0 resolver: Using user-specified device='{selected_device}'")
     else:
-        selected_device = get_best_device()
+        # CTranslate2 backends: resolve via ctranslate2's own device count.
+        # NEVER call torch.cuda.* before the ct2 model is created — on ROCm
+        # builds that poisons ct2's HIP host memory pool and leaks host RAM
+        # per transcribe() call (see get_ct2_gpu_device in device_detector).
+        if asr_component.provider in CTRANSLATE2_PROVIDERS:
+            selected_device = get_ct2_gpu_device()
+        else:
+            selected_device = get_best_device()
         logger.debug(f"v3.0 resolver: Auto-detected device='{selected_device}'")
 
     if compute_type and compute_type != "auto":

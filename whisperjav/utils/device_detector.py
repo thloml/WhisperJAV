@@ -143,6 +143,23 @@ def ct2_supports_gpu() -> bool:
         return False
 
 
+def get_ct2_gpu_device(prefer_cpu: bool = False) -> str:
+    """
+    Optimistic device string for CTranslate2 backends.
+
+    IMPORTANT: this intentionally does NOT query ctranslate2. On ROCm builds,
+    any ctranslate2 API call (e.g. get_cuda_device_count) or torch.cuda.* call
+    made BEFORE the model is created poisons ct2's HIP host memory pool —
+    every subsequent transcribe() leaks host RAM (verified on gfx1201:
+    5-150MB per call). Device selection is therefore optimistic ("cuda") and
+    the ASR modules fall back to CPU if the model fails to load on CUDA.
+
+    Returns:
+        "cuda" unless prefer_cpu is set.
+    """
+    return "cpu" if prefer_cpu else "cuda"
+
+
 def get_best_device(prefer_cpu: bool = False) -> str:
     """
     Auto-detect and return the best available compute device.
@@ -205,23 +222,17 @@ def get_ctranslate2_device(prefer_cpu: bool = False) -> str:
     machine) fall back to CPU. Torch-based pipelines (openai_whisper,
     stable_ts, transformers) can still use the GPU via get_best_device().
 
+    NOTE: this never queries ctranslate2 or torch before the model is
+    created — see get_ct2_gpu_device() for why (ROCm host-memory leak).
+    The ASR modules try "cuda" and fall back to CPU on load failure.
+
     Args:
         prefer_cpu: Force CPU mode even if GPU available
 
     Returns:
-        Device string: "cuda" (when supported) or "cpu"
+        Device string: "cuda" (optimistic) or "cpu"
     """
-    device = get_best_device(prefer_cpu)
-    if device == "cuda" and not ct2_supports_gpu():
-        logger.warning(
-            "GPU detected, but the installed ctranslate2/faster-whisper build "
-            "cannot use it (CPU-only build, or no CUDA/ROCm backend for this GPU). "
-            "Running the CTranslate2 pipeline on CPU. "
-            "For GPU-accelerated transcription, use --asr openai_whisper "
-            "(or stable_ts)."
-        )
-        return "cpu"
-    return device
+    return get_ct2_gpu_device(prefer_cpu)
 
 
 def get_device_info() -> Dict[str, any]:
