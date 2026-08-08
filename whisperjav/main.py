@@ -280,6 +280,12 @@ def parse_arguments():
                                help="Compute type for ASR processing (default: auto). "
                                     "CTranslate2 backends (faster_whisper, kotoba) use 'auto' to optimize "
                                     "based on GPU capability. PyTorch backends use float16 (GPU) or float32 (CPU).")
+    hardware_group.add_argument("--max-worker-rss-pct", type=int, default=None,
+                               choices=range(1, 101), metavar="[1-100]",
+                               help="Recycle the scene-transcription worker when its peak host RAM "
+                                    "exceeds this percentage of the system's total memory (default: 50). "
+                                    "Bounds the ctranslate2 ROCm host-RAM leak; higher values mean "
+                                    "fewer model reloads.")
 
     # Path and logging
     path_group = parser.add_argument_group("Path and Logging Options")
@@ -449,6 +455,11 @@ def parse_arguments():
     translation_group.add_argument(
         "--translate-endpoint",
         help="Custom API endpoint URL for translation (for OpenAI-compatible APIs)"
+    )
+    translation_group.add_argument(
+        "--translate-max-tokens", type=int, default=None,
+        help="Override max output tokens per translation request (e.g., 16384, 32768). "
+             "Useful for thinking models whose reasoning can exhaust a small output budget."
     )
     translation_group.add_argument(
         "--ollama-url",
@@ -984,6 +995,8 @@ def process_files_sync(media_files: List[Dict], args: argparse.Namespace, resolv
         "progress_display": progress,
         "parameter_tracer": tracer,
     }
+    if getattr(args, "max_worker_rss_pct", None):
+        pipeline_args["max_worker_rss_pct"] = args.max_worker_rss_pct
 
     # Select pipeline
     # --pipeline takes priority over --mode when specified
@@ -1303,6 +1316,7 @@ def process_files_sync(media_files: List[Dict], args: argparse.Namespace, resolv
                             extra_context=build_translation_context(args),
                             n_gpu_layers=getattr(args, 'translate_gpu_layers', -1),
                             endpoint=getattr(args, 'translate_endpoint', None),
+                            max_tokens=getattr(args, 'translate_max_tokens', None),
                             ollama_url=getattr(args, 'ollama_url', None),
                             auto_confirm=getattr(args, 'yes', False),
                             ollama_max_tokens=getattr(args, 'ollama_max_tokens', None),
@@ -1530,7 +1544,8 @@ def process_files_async(media_files: List[Dict], args: argparse.Namespace, resol
                                     debug=getattr(args, 'debug', False),
                                     extra_context=build_translation_context(args),
                                     n_gpu_layers=getattr(args, 'translate_gpu_layers', -1),
-                                    endpoint=getattr(args, 'translate_endpoint', None)
+                                    endpoint=getattr(args, 'translate_endpoint', None),
+                                    max_tokens=getattr(args, 'translate_max_tokens', None)
                                 )
 
                                 if translated_path:
@@ -2383,7 +2398,8 @@ def main():
                             debug=getattr(args, 'debug', False),
                             extra_context=extra_context,
                             n_gpu_layers=getattr(args, 'translate_gpu_layers', -1),
-                            endpoint=getattr(args, 'translate_endpoint', None)
+                            endpoint=getattr(args, 'translate_endpoint', None),
+                            max_tokens=getattr(args, 'translate_max_tokens', None)
                         )
 
                         if translated_path:

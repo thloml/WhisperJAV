@@ -21,6 +21,9 @@ DEFAULT_SETTINGS = {
     'tone': 'standard',
     'scene_threshold': 60.0,
     'max_batch_size': 30,
+    # Optional output token cap (max_tokens) for translation providers.
+    # None = use provider/PySubtrans default (e.g. DeepSeek 8192).
+    'max_tokens': None,
     'include_original': False,
     'preprocess_subtitles': True,
     'postprocess_translation': True,
@@ -35,7 +38,10 @@ DEFAULT_SETTINGS = {
         'top_p': None
     },
     'instructions_files': {},
-    'ollama_url': None
+    'ollama_url': None,
+    # Standalone "AI SRT Translate" tab form state. Kept separate from the
+    # ensemble translation modal so the two pages don't overwrite each other.
+    'translator_tab': {}
 }
 
 

@@ -187,12 +187,18 @@ def _get_compute_type_for_device(device: str, provider: str) -> str:
         # int8 are leak-free. This check must come before the NVIDIA-specific
         # Pascal/Blackwell branches (which would misdetect AMD anyway).
         if is_rocm_build():
+            # int8 is the ROCm default: float16/mixed-precision types leak host
+            # RAM on the community HIP ctranslate2 build, while int8 is leak-free
+            # AND roughly 1.8x faster than float32 for inference (measured on
+            # gfx1201: ~1.65s per 15s clip steady-state vs ~3.0s float32). To
+            # restore the float32 default, pass --compute-type float32.
             logger.info(
-                "ROCm build detected: using float32 compute_type. "
-                "float16/mixed-precision types leak host memory on the HIP "
-                "ctranslate2 build; use --compute-type int8 for more speed."
+                "ROCm build detected: using int8 compute_type (leak-free, "
+                "~1.8x faster than float32). float16/mixed-precision types "
+                "leak host memory on the HIP ctranslate2 build; use "
+                "--compute-type float32 for the old default."
             )
-            return "float32"
+            return "int8"
 
         # Pascal workaround (sm_6x): Pascal GPUs (GTX 10xx, Quadro Pxxx) are
         # reported to not support efficient float16 in CTranslate2.

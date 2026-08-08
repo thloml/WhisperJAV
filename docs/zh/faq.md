@@ -86,6 +86,10 @@
 1. 在高级设置中减小 **最大批量大小**（尝试 15 或 10）
 2. 使用上下文窗口更大的模型
 3. WhisperJAV 会自动为本地大语言模型限制批量大小
+4. 调大输出预算：在 GUI 翻译设置的高级选项中设置 **Max Output Tokens**
+   （或命令行 `--max-tokens` / `--translate-max-tokens`，如 16384 或 32768）。
+   对默认开启思考的 DeepSeek V4 系列尤其有效——推理过程会吃光较小的输出预算，
+   导致返回空内容（`finish_reason=length`）。
 
 ### Linux 上翻译显示 "Unknown provider: Gemini"
 

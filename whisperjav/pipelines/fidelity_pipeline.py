@@ -123,6 +123,11 @@ class FidelityPipeline(BasePipeline):
             'task': task,
             'tracer': self.tracer
         }
+
+        # Worker memory recycling limit (% of system RAM) from CLI/GUI
+        # (--max-worker-rss-pct). Passed to scene_batch_worker via the worker
+        # cfg JSON; None = runner default.
+        self._max_worker_rss_pct = kwargs.get("max_worker_rss_pct")
         # NOTE: self.asr is NOT created here - it's a local variable in process()
 
         self.stitcher = SRTStitcher()
@@ -307,7 +312,7 @@ class FidelityPipeline(BasePipeline):
             nonverbal_filtered = 0
 
             import json as _json
-            import subprocess as _subprocess
+            from whisperjav.modules.scene_batch_runner import SceneBatchRunner
 
             # JSON-serializable ASR config for the workers
             asr_cfg = {
@@ -316,108 +321,108 @@ class FidelityPipeline(BasePipeline):
                 "asr_class": "whisper_pro",
             }
 
+            if self._max_worker_rss_pct:
+                asr_cfg["max_worker_rss_pct"] = int(self._max_worker_rss_pct)
+
+            # Worker config is identical for every batch; write it once.
+            worker_cfg_path = scene_srts_dir / "asr_worker.cfg.json"
+            worker_cfg_path.write_text(_json.dumps(asr_cfg, default=str), encoding="utf-8")
+
             batches = [
                 scene_paths[i:i + BATCH_SCENES]
                 for i in range(0, total_scenes, BATCH_SCENES)
             ]
             done = 0
-            for bi, batch in enumerate(batches):
-                batch_items = [
-                    (idx, sp, st)
-                    for idx, (sp, st, _, _) in enumerate(scene_paths)
-                    if any(sp == b[0] for b in batch)
-                ]
-                batch_map = {str(sp): (idx, sp, st) for idx, sp, st in batch_items}
+            runner = None
+            try:
+                # One persistent worker: the model loads once per worker lifetime
+                # and the worker is recycled only after MAX_SCENES_PER_WORKER
+                # scenes, bounding the ROCm ctranslate2 host-RAM leak while
+                # amortizing the model-load cost across many scenes.
+                runner = SceneBatchRunner(scene_srts_dir, self.asr_task, worker_cfg_path)
+                for bi, batch in enumerate(batches):
+                    batch_items = [
+                        (idx, sp, st)
+                        for idx, (sp, st, _, _) in enumerate(scene_paths)
+                        if any(sp == b[0] for b in batch)
+                    ]
+                    batch_map = {str(sp): (idx, sp, st) for idx, sp, st in batch_items}
 
-                batch_path = scene_srts_dir / f"batch_{bi:04d}.json"
-                cfg_path = scene_srts_dir / f"batch_{bi:04d}.cfg.json"
-                results_path = scene_srts_dir / f"batch_{bi:04d}.results.json"
-                batch_path.write_text(
-                    _json.dumps([str(sp) for _, sp, _ in batch_items]), encoding="utf-8")
-                cfg_path.write_text(_json.dumps(asr_cfg, default=str), encoding="utf-8")
-                if results_path.exists():
-                    results_path.unlink()
+                    batch_path = scene_srts_dir / f"batch_{bi:04d}.json"
+                    results_path = scene_srts_dir / f"batch_{bi:04d}.results.json"
+                    batch_path.write_text(
+                        _json.dumps([str(sp) for _, sp, _ in batch_items]), encoding="utf-8")
+                    if results_path.exists():
+                        results_path.unlink()
 
-                try:
-                    _subprocess.run(
-                        [sys.executable, "-m", "whisperjav.modules.scene_batch_worker",
-                         str(batch_path), str(scene_srts_dir), self.asr_task, str(cfg_path)],
-                        timeout=3600,
-                        check=False,
-                    )
-                except Exception as e:
-                    logger.error(f"Scene batch {bi} failed to run: {e}")
+                    results = runner.transcribe_batch(batch_path)
 
-                results = []
-                if results_path.exists():
-                    try:
-                        results = _json.loads(results_path.read_text(encoding="utf-8"))
-                    except Exception as e:
-                        logger.error(f"Failed to read batch results {results_path}: {e}")
+                    for item in results:
+                        scene = item.get("scene")
+                        if scene not in batch_map:
+                            continue
+                        idx, scene_path, start_time_sec = batch_map[scene]
+                        scene_num = idx + 1
 
-                for item in results:
-                    scene = item.get("scene")
-                    if scene not in batch_map:
-                        continue
-                    idx, scene_path, start_time_sec = batch_map[scene]
-                    scene_num = idx + 1
+                        fstats = item.get("filter_stats", {}) or {}
+                        logprob_filtered += fstats.get('logprob_filtered', 0)
+                        nonverbal_filtered += fstats.get('nonverbal_filtered', 0)
 
-                    fstats = item.get("filter_stats", {}) or {}
-                    logprob_filtered += fstats.get('logprob_filtered', 0)
-                    nonverbal_filtered += fstats.get('nonverbal_filtered', 0)
-
-                    if item.get("ok"):
-                        srt_path = Path(item["srt"])
-                        if srt_path.exists() and srt_path.stat().st_size > 0:
-                            scene_srt_info.append((srt_path, start_time_sec))
-                            master_metadata["scenes_detected"][idx]["transcribed"] = True
-                            master_metadata["scenes_detected"][idx]["srt_path"] = str(srt_path)
+                        if item.get("ok"):
+                            srt_path = Path(item["srt"])
+                            if srt_path.exists() and srt_path.stat().st_size > 0:
+                                scene_srt_info.append((srt_path, start_time_sec))
+                                master_metadata["scenes_detected"][idx]["transcribed"] = True
+                                master_metadata["scenes_detected"][idx]["srt_path"] = str(srt_path)
+                            else:
+                                master_metadata["scenes_detected"][idx]["transcribed"] = True
+                                master_metadata["scenes_detected"][idx]["no_speech_detected"] = True
                         else:
-                            master_metadata["scenes_detected"][idx]["transcribed"] = True
-                            master_metadata["scenes_detected"][idx]["no_speech_detected"] = True
-                    else:
-                        master_metadata["scenes_detected"][idx]["transcribed"] = False
-                        master_metadata["scenes_detected"][idx]["error"] = item.get("error", "unknown")
-                        self.progress.show_message(
-                            f"Scene {scene_num}/{total_scenes} failed: {item.get('error', '')}",
-                            "error", 2.0)
+                            master_metadata["scenes_detected"][idx]["transcribed"] = False
+                            master_metadata["scenes_detected"][idx]["error"] = item.get("error", "unknown")
+                            self.progress.show_message(
+                                f"Scene {scene_num}/{total_scenes} failed: {item.get('error', '')}",
+                                "error", 2.0)
 
-                    done += 1
-                    self.progress.update_subtask(1)
-
-                # Mark any scenes the worker did not report as failed
-                reported = {item.get("scene") for item in results}
-                for idx, scene_path, _ in batch_items:
-                    if str(scene_path) not in reported:
-                        master_metadata["scenes_detected"][idx]["transcribed"] = False
-                        master_metadata["scenes_detected"][idx]["error"] = "worker did not report scene"
-                        self.progress.update_subtask(1)
                         done += 1
+                        self.progress.update_subtask(1)
 
-                # Show batch-level progress
-                should_show_update = (
-                    done == total_scenes or
-                    bi == 0 or
-                    time.time() - last_update_time > update_interval
-                )
-                if should_show_update:
-                    progress_pct = (done / total_scenes) * 100
-                    bar_width = 30
-                    filled_width = int(bar_width * done / total_scenes)
-                    progress_bar = '=' * filled_width + '-' * (bar_width - filled_width)
-                    eta_text = ""
-                    if done > 3:
-                        elapsed = time.time() - transcription_start_time
-                        avg_time_per_scene = elapsed / done
-                        remaining_scenes = total_scenes - done
-                        eta_seconds = remaining_scenes * avg_time_per_scene
-                        if eta_seconds > 60:
-                            eta_text = f" | ETA: {eta_seconds/60:.1f}m"
-                        else:
-                            eta_text = f" | ETA: {eta_seconds:.0f}s"
-                    print(f"\rTranscribing: [{progress_bar}] {done}/{total_scenes} [{progress_pct:.1f}%]{eta_text}",
-                          end='', flush=True)
-                    last_update_time = time.time()
+                    # Mark any scenes the worker did not report as failed
+                    reported = {item.get("scene") for item in results}
+                    for idx, scene_path, _ in batch_items:
+                        if str(scene_path) not in reported:
+                            master_metadata["scenes_detected"][idx]["transcribed"] = False
+                            master_metadata["scenes_detected"][idx]["error"] = "worker did not report scene"
+                            self.progress.update_subtask(1)
+                            done += 1
+
+                    # Show batch-level progress
+                    should_show_update = (
+                        done == total_scenes or
+                        bi == 0 or
+                        time.time() - last_update_time > update_interval
+                    )
+                    if should_show_update:
+                        progress_pct = (done / total_scenes) * 100
+                        bar_width = 30
+                        filled_width = int(bar_width * done / total_scenes)
+                        progress_bar = '=' * filled_width + '-' * (bar_width - filled_width)
+                        eta_text = ""
+                        if done > 3:
+                            elapsed = time.time() - transcription_start_time
+                            avg_time_per_scene = elapsed / done
+                            remaining_scenes = total_scenes - done
+                            eta_seconds = remaining_scenes * avg_time_per_scene
+                            if eta_seconds > 60:
+                                eta_text = f" | ETA: {eta_seconds/60:.1f}m"
+                            else:
+                                eta_text = f" | ETA: {eta_seconds:.0f}s"
+                        print(f"\rTranscribing: [{progress_bar}] {done}/{total_scenes} [{progress_pct:.1f}%]{eta_text}",
+                              end='', flush=True)
+                        last_update_time = time.time()
+            finally:
+                if runner is not None:
+                    runner.close()
 
             self.progress.finish_subtask()
 

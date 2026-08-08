@@ -109,6 +109,11 @@ Your subtitle batches are too large for the model's context window. Try:
 1. Reduce **Max Batch Size** in Advanced Settings (try 15 or 10)
 2. Use a model with a larger context window
 3. WhisperJAV auto-caps batch size for local LLMs
+4. Raise the output budget: set **Max Output Tokens** in the GUI translation
+   settings (Advanced), or pass `--max-tokens` / `--translate-max-tokens`
+   (e.g. 16384 or 32768). This is especially useful with DeepSeek V4 series,
+   whose default reasoning can exhaust a small output budget and return empty
+   content (`finish_reason=length`).
 
 ### Translation shows "Unknown provider: Gemini" on Linux
 

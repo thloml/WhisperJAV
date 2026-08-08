@@ -201,6 +201,22 @@ class WhisperJAVAPI:
         if model_override:
             args += ["--model", model_override]
 
+        # Precision (compute type) — "auto" means let the resolver choose
+        # (int8 on ROCm). Only forward explicit non-auto choices.
+        compute_type = str(options.get('compute_type', 'auto') or 'auto').strip()
+        if compute_type and compute_type != 'auto':
+            args += ["--compute-type", compute_type]
+
+        # Worker memory recycling limit (% of system RAM). Empty/0 = runner default.
+        max_rss = options.get('max_worker_rss_pct')
+        if max_rss not in (None, '', 0):
+            try:
+                rss_pct = int(max_rss)
+                if 1 <= rss_pct <= 100:
+                    args += ["--max-worker-rss-pct", str(rss_pct)]
+            except (TypeError, ValueError):
+                pass
+
         # Opening credit
         credit = options.get('credit', '').strip()
         if credit:
@@ -2757,6 +2773,9 @@ class WhisperJAVAPI:
             if config.get('translate_endpoint'):
                 args += ["--translate-endpoint", config['translate_endpoint']]
 
+            if config.get('translate_max_tokens'):
+                args += ["--translate-max-tokens", str(config['translate_max_tokens'])]
+
             # Streaming — default True: prevents read timeout on slow MPS/CPU inference.
             # Non-streaming blocks the HTTP connection until the last token arrives; on
             # slow local backends this exceeds the timeout every batch. Streaming delivers
@@ -3106,11 +3125,14 @@ class WhisperJAVAPI:
                 'plot': backend.get('movie_plot', '') or '',
                 'sceneThreshold': backend.get('scene_threshold', 60),
                 'maxBatchSize': backend.get('max_batch_size', 30),
+                'maxTokens': backend.get('max_tokens') or '',
                 'temperature': model_params.get('temperature') or 0.5,
                 'topP': model_params.get('top_p') or 0.9,
                 'customEndpoint': backend.get('custom_endpoint', '') or '',
                 'ollamaUrl': backend.get('ollama_url', '') or '',
                 'provider': backend.get('provider', ''),
+                'model': backend.get('model', '') or '',
+                'translatorTab': backend.get('translator_tab') or {},
             }
             return {"success": True, "settings": gui_settings}
         except Exception as e:
@@ -3153,12 +3175,18 @@ class WhisperJAVAPI:
                 existing['scene_threshold'] = float(settings['sceneThreshold'])
             if 'maxBatchSize' in settings:
                 existing['max_batch_size'] = int(settings['maxBatchSize'])
+            if 'maxTokens' in settings:
+                existing['max_tokens'] = int(settings['maxTokens']) if settings['maxTokens'] else None
             if 'customEndpoint' in settings:
                 existing['custom_endpoint'] = settings['customEndpoint'] or None
             if 'ollamaUrl' in settings:
                 existing['ollama_url'] = settings['ollamaUrl'] or None
             if 'provider' in settings:
                 existing['provider'] = settings['provider']
+            if 'model' in settings:
+                existing['model'] = settings['model'] or None
+            if 'translatorTab' in settings:
+                existing['translator_tab'] = settings['translatorTab'] or {}
 
             # Nested model_params
             mp = existing.setdefault('model_params', {})
@@ -3198,6 +3226,8 @@ class WhisperJAVAPI:
         "temp_dir":                  "tempDir",
         "accept_cpu_mode":           "acceptCpuMode",
         "async_processing":          "asyncProcessing",
+        "compute_type":              "computeType",
+        "max_worker_rss_pct":        "maxWorkerRssPct",
         "pass1_pipeline":            "pass1Pipeline",
         "pass1_sensitivity":         "pass1Sensitivity",
         "pass1_scene_detector":      "pass1SceneDetector",
@@ -3657,6 +3687,8 @@ class WhisperJAVAPI:
                 args.extend(["--scene-threshold", str(options['scene_threshold'])])
             if options.get('max_batch_size'):
                 args.extend(["--max-batch-size", str(options['max_batch_size'])])
+            if options.get('max_tokens'):
+                args.extend(["--max-tokens", str(options['max_tokens'])])
             if options.get('max_retries'):
                 args.extend(["--max-retries", str(options['max_retries'])])
             # Output directory — honor the shared Destination section.

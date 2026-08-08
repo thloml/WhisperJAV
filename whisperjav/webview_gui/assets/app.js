@@ -760,6 +760,10 @@ const FormManager = {
             // Async processing (conditional)
             async_processing: asyncProcessingEnabled,
 
+            // Performance tunables (Tab 2 Advanced) — empty/auto = backend default
+            compute_type: document.getElementById('computeType')?.value || 'auto',
+            max_worker_rss_pct: document.getElementById('maxWorkerRssPct')?.value || '',
+
         };
     }
 };
@@ -5127,6 +5131,7 @@ const EnsembleManager = {
             config.translate_actress = translateSettings.actress || null;
             config.translate_plot = translateSettings.plot || null;
             config.translate_endpoint = translateSettings.customEndpoint || null;
+            config.translate_max_tokens = translateSettings.maxTokens || null;
         }
 
         return config;
@@ -6611,6 +6616,75 @@ const TranslatorManager = {
         currentFile: null
     },
 
+    // ---- Persistence (auto-save the standalone translator tab) ----
+    _FORM_FIELDS: [
+        'translatorProvider', 'translatorModel', 'translatorCustomModel',
+        'translatorApiKey', 'translatorSourceLang', 'translatorTargetLang',
+        'translatorTone', 'translatorMovieTitle', 'translatorNames',
+        'translatorPlot', 'translatorSceneThreshold', 'translatorMaxBatchSize',
+        'translatorMaxTokens', 'translatorMaxRetries', 'translatorRateLimit',
+        'translatorCustomEndpoint'
+    ],
+    _saveTimer: null,
+
+    collectForm() {
+        const out = {};
+        this._FORM_FIELDS.forEach(id => {
+            const el = document.getElementById(id);
+            if (el) out[id] = el.value;
+        });
+        return out;
+    },
+
+    async applyForm(values) {
+        if (!values || typeof values !== 'object') return;
+
+        // Provider first: it drives model dropdown / API-key row visibility.
+        if (values.translatorProvider) {
+            const providerEl = document.getElementById('translatorProvider');
+            if (providerEl) {
+                providerEl.value = values.translatorProvider;
+                await ProviderUIManager.onProviderChange(values.translatorProvider, 'srt');
+                this.updateApiKeyStatus(values.translatorProvider);
+            }
+        }
+
+        // Apply the rest. For selects, skip values that no longer exist in the
+        // current option list (e.g. model was removed from the provider catalog).
+        for (const id of this._FORM_FIELDS) {
+            if (id === 'translatorProvider' || !(id in values)) continue;
+            const el = document.getElementById(id);
+            if (!el) continue;
+            if (el.tagName === 'SELECT' && ![...el.options].some(o => o.value === values[id])) {
+                continue;
+            }
+            el.value = values[id];
+        }
+    },
+
+    scheduleSave() {
+        clearTimeout(this._saveTimer);
+        this._saveTimer = setTimeout(() => this.persistNow(), 500);
+    },
+
+    async persistNow() {
+        if (!window.pywebview?.api) return;
+        try {
+            const result = await pywebview.api.save_translation_settings({ translatorTab: this.collectForm() });
+            if (result && result.success) {
+                ConsoleManager.log('AI SRT Translate settings saved', 'info');
+            }
+        } catch (e) {
+            console.warn('Could not save translator settings:', e);
+        }
+    },
+
+    restoreFromBackend(values) {
+        if (values && Object.keys(values).length > 0) {
+            this.applyForm(values);
+        }
+    },
+
     // Provider model options (Ollama models are now driven by OllamaStateManager)
     providerModels: {
         local: ['gemma-9b', 'llama-8b', 'llama-3b', 'auto'],
@@ -6629,6 +6703,15 @@ const TranslatorManager = {
         document.getElementById('translatorProvider')?.addEventListener('change', (e) => {
             ProviderUIManager.onProviderChange(e.target.value, 'srt');
             this.updateApiKeyStatus(e.target.value);
+        });
+
+        // Auto-save any change on the translator tab (debounced)
+        this._FORM_FIELDS.forEach(id => {
+            const el = document.getElementById(id);
+            if (el) {
+                el.addEventListener('input', () => this.scheduleSave());
+                el.addEventListener('change', () => this.scheduleSave());
+            }
         });
 
         // Bind test connection
@@ -6772,6 +6855,8 @@ const TranslatorManager = {
             plot: document.getElementById('translatorPlot')?.value || null,
             scene_threshold: parseFloat(document.getElementById('translatorSceneThreshold')?.value) || 60,
             max_batch_size: parseInt(document.getElementById('translatorMaxBatchSize')?.value) || 30,
+            max_tokens: document.getElementById('translatorMaxTokens')?.value ?
+                       parseInt(document.getElementById('translatorMaxTokens').value) : null,
             rate_limit: document.getElementById('translatorRateLimit')?.value ?
                        parseInt(document.getElementById('translatorRateLimit').value) : null,
             max_retries: parseInt(document.getElementById('translatorMaxRetries')?.value) || 3,
@@ -6787,6 +6872,10 @@ const TranslatorManager = {
             ErrorHandler.show('No Files', 'Add SRT files in the Source section above, then start translation.');
             return;
         }
+
+        // Make sure the latest form state is persisted even if the debounce
+        // timer hasn't fired yet.
+        this.persistNow();
 
         const options = this.collectOptions();
 
@@ -7050,6 +7139,7 @@ const TranslateIntegrationManager = {
                 plot: fullSettings.plot,
                 sceneThreshold: fullSettings.sceneThreshold,
                 maxBatchSize: fullSettings.maxBatchSize,
+                maxTokens: fullSettings.maxTokens,
                 temperature: fullSettings.temperature,
                 topP: fullSettings.topP,
                 customEndpoint: fullSettings.customEndpoint
@@ -7200,6 +7290,7 @@ const TranslationSettingsModal = {
         plot: '',
         sceneThreshold: 60,
         maxBatchSize: 30,
+        maxTokens: '',
         temperature: 0.5,
         topP: 0.9,
         customEndpoint: '',
@@ -7279,9 +7370,15 @@ const TranslationSettingsModal = {
         this.settings.plot = document.getElementById('translationPlot')?.value || '';
         this.settings.sceneThreshold = parseInt(document.getElementById('translationSceneThreshold')?.value) || 60;
         this.settings.maxBatchSize = parseInt(document.getElementById('translationMaxBatchSize')?.value) || 30;
+        this.settings.maxTokens = parseInt(document.getElementById('translationMaxTokens')?.value) || '';
         this.settings.temperature = parseFloat(document.getElementById('translationTemperature')?.value) || 0.5;
         this.settings.topP = parseFloat(document.getElementById('translationTopP')?.value) || 0.9;
         this.settings.customEndpoint = document.getElementById('translationCustomEndpoint')?.value || '';
+
+        // Also capture the current provider and model from the main dropdown
+        // (these must be persisted to backend because localStorage is wiped on restart)
+        this.settings.provider = document.getElementById("ensembleTranslateProvider")?.value || "";
+        this.settings.model = document.getElementById("ensembleTranslateModel")?.value || "";
         this.settings.ollamaUrl = document.getElementById('translationOllamaUrl')?.value || '';
 
         // Persist to localStorage (fast cache / fallback)
@@ -7326,6 +7423,44 @@ const TranslationSettingsModal = {
             const result = await pywebview.api.get_translation_settings();
             if (result.success && result.settings) {
                 this.settings = { ...this.settings, ...result.settings };
+
+                // Restore provider dropdown from backend settings (localStorage is
+                // wiped on restart due to private_mode=True in PyWebView)
+                if (result.settings.provider) {
+                    const dd = document.getElementById("ensembleTranslateProvider");
+                    if (dd && dd.value !== result.settings.provider) {
+                        dd.value = result.settings.provider;
+                        ProviderUIManager.onProviderChange(result.settings.provider, "ensemble");
+                        this.updateModelOptions(result.settings.provider);
+                        // Show/hide Ollama URL field
+                        document.querySelectorAll(".ollama-settings-row").forEach(el => {
+                            el.style.display = (result.settings.provider === "ollama") ? "block" : "none";
+                        });
+                    }
+                }
+                // Restore model dropdown selection
+                if (result.settings.model) {
+                    const modelEl = document.getElementById("ensembleTranslateModel");
+                    if (modelEl) modelEl.value = result.settings.model;
+                }
+
+                // Also restore SRT (quick translate) tab provider from backend
+                if (result.settings.provider) {
+                    const srtDd = document.getElementById("translatorProvider");
+                    if (srtDd && srtDd.value !== result.settings.provider) {
+                        srtDd.value = result.settings.provider;
+                        ProviderUIManager.onProviderChange(result.settings.provider, "srt");
+                        TranslatorManager.updateApiKeyStatus(result.settings.provider);
+                    }
+                }
+
+                // Restore the standalone "AI SRT Translate" tab's own saved
+                // form state (overrides the shared provider sync above when
+                // the translator tab has its own saved config).
+                if (result.settings.translatorTab) {
+                    TranslatorManager.restoreFromBackend(result.settings.translatorTab);
+                }
+
                 console.log('Translation settings loaded from backend file');
             }
         } catch (e) {
@@ -7342,6 +7477,7 @@ const TranslationSettingsModal = {
         document.getElementById('translationPlot').value = this.settings.plot;
         document.getElementById('translationSceneThreshold').value = this.settings.sceneThreshold;
         document.getElementById('translationMaxBatchSize').value = this.settings.maxBatchSize;
+        document.getElementById('translationMaxTokens').value = this.settings.maxTokens || '';
         document.getElementById('translationTemperature').value = this.settings.temperature;
         document.getElementById('translationTopP').value = this.settings.topP;
         document.getElementById('translationCustomEndpoint').value = this.settings.customEndpoint;
@@ -7458,6 +7594,7 @@ const TranslationSettingsModal = {
             plot: this.settings.plot,
             sceneThreshold: this.settings.sceneThreshold,
             maxBatchSize: this.settings.maxBatchSize,
+            maxTokens: this.settings.maxTokens,
             temperature: this.settings.temperature,
             topP: this.settings.topP,
             customEndpoint: this.settings.customEndpoint,
@@ -7470,15 +7607,62 @@ const TranslationSettingsModal = {
 // GUI Settings Persistence
 // ============================================================
 const SettingsPersistence = {
-    // Disabled: Tab 1 + Tab 3 always start from HTML defaults.
-    // Backend module (gui_settings.py) retained for future "exit prompt" feature.
-    // Preset CRUD (EnsembleManager) is unaffected.
-    init() {},
-    collectAll() { return {}; },
-    applyToForm() {},
-    async loadFromBackend() {},
-    scheduleSave() {},
-    async _doSave() {},
+    // Persists ONLY the performance tunables (Precision + Worker RSS limit).
+    // All other fields intentionally keep their HTML defaults (full persistence
+    // of every form field is disabled to avoid surprising form resets).
+    _FIELDS: ['computeType', 'maxWorkerRssPct'],
+    _saveTimer: null,
+
+    init() {
+        this._FIELDS.forEach(id => {
+            const el = document.getElementById(id);
+            if (el) el.addEventListener('change', () => this.scheduleSave());
+        });
+    },
+
+    collectAll() {
+        const out = {};
+        this._FIELDS.forEach(id => {
+            const el = document.getElementById(id);
+            if (el) out[id] = el.value;
+        });
+        return out;
+    },
+
+    applyToForm(settings) {
+        if (!settings) return;
+        this._FIELDS.forEach(id => {
+            const el = document.getElementById(id);
+            if (el && settings[id] !== undefined && settings[id] !== null && settings[id] !== '') {
+                el.value = settings[id];
+            }
+        });
+    },
+
+    async loadFromBackend() {
+        try {
+            const res = await pywebview.api.get_gui_settings();
+            if (res && res.success && res.settings) {
+                this.applyToForm(res.settings);
+            }
+        } catch (e) {
+            console.warn('Failed to load GUI settings:', e);
+        }
+    },
+
+    scheduleSave() {
+        clearTimeout(this._saveTimer);
+        this._saveTimer = setTimeout(() => this._doSave(), 500);
+    },
+
+    async _doSave() {
+        try {
+            await pywebview.api.save_gui_settings(this.collectAll());
+        } catch (e) {
+            console.warn('Failed to save GUI settings:', e);
+        }
+    },
+
     async restorePresets() {},
 };
 
@@ -7496,6 +7680,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     ModeManager.init();
     FileListManager.init();
     FormManager.init();
+    SettingsPersistence.init();
     ConsoleManager.init();
     ProgressManager.init();
     DirectoryControls.init();
@@ -7536,6 +7721,7 @@ window.addEventListener('pywebviewready', async () => {
     ConsoleManager.log('PyWebView bridge connected', 'success');
 
     await AppState.loadDefaultOutputDir();
+    await SettingsPersistence.loadFromBackend();
     await EnsembleManager.updateSegmenterAvailability();
     await EnsembleManager.updateEnhancerAvailability();
 

@@ -279,6 +279,12 @@ def main():
         help="Max retries on API failure (default: 3)"
     )
     api_group.add_argument(
+        '--max-tokens',
+        type=int,
+        help="Maximum output tokens per translation request (0/omit = provider default). "
+             "Useful for thinking models whose reasoning can exhaust a small output budget."
+    )
+    api_group.add_argument(
         '--backoff-time',
         type=float,
         default=5.0,
@@ -531,6 +537,14 @@ def main():
     effective_tone = merged.get('tone') or 'standard'
     provider_options = build_provider_options(args, merged.get('model_params', {}), effective_tone)
 
+    # Explicit --max-tokens (CLI flag) wins; otherwise honor settings.json max_tokens.
+    # Applied after auto-computed local caps so an explicit value is authoritative.
+    _user_max_tokens = getattr(args, 'max_tokens', None)
+    if _user_max_tokens is None:
+        _user_max_tokens = merged.get('max_tokens')
+    if _user_max_tokens is not None:
+        provider_options['max_tokens'] = _user_max_tokens
+
     # Build extra context
     extra_context = build_extra_context(args)
 
@@ -547,6 +561,7 @@ def main():
     print(f"  Tone: {effective_tone}", file=sys.stderr)
     print(f"  Scene threshold: {merged.get('scene_threshold', 60.0)}s", file=sys.stderr)
     print(f"  Max batch size: {merged.get('max_batch_size', 30)}", file=sys.stderr)
+    print(f"  Max tokens: {provider_options.get('max_tokens', 'auto (provider default)')}", file=sys.stderr)
     if instruction_file:
         print(f"  Instructions: {instruction_file}", file=sys.stderr)
     print(f"  Provider options: {provider_options}", file=sys.stderr)

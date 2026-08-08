@@ -50,6 +50,11 @@ DEFAULT_GUI_SETTINGS = {
     "accept_cpu_mode": False,
     "async_processing": False,
 
+    # Performance tunables (Tab 2 Advanced) — persisted so the user's chosen
+    # precision and worker memory limit survive across sessions.
+    "compute_type": "auto",
+    "max_worker_rss_pct": 50,
+
     # Tab 3 — Ensemble  (values MUST match index.html `selected` attrs)
     "pass1_pipeline": "balanced",
     "pass1_sensitivity": "aggressive",

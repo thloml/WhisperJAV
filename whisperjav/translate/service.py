@@ -198,6 +198,7 @@ def translate_with_config(
     max_batch_size: Optional[int] = None,
     temperature: Optional[float] = None,
     top_p: Optional[float] = None,
+    max_tokens: Optional[int] = None,
     stream: bool = False,
     debug: bool = False,
     extra_context: Optional[str] = None,
@@ -234,6 +235,7 @@ def translate_with_config(
         max_batch_size: Maximum batch size for translation
         temperature: Model temperature (0.0-2.0)
         top_p: Model top_p (0.0-1.0)
+        max_tokens: Maximum output tokens per request (None = provider default)
         stream: Stream translation progress
         debug: Enable debug output
         extra_context: Additional context for translation (movie title, etc.)
@@ -310,6 +312,7 @@ def translate_with_config(
     # Resolve processing options
     resolved_scene_threshold = scene_threshold if scene_threshold is not None else settings.get('scene_threshold', 60.0)
     resolved_max_batch_size = max_batch_size if max_batch_size is not None else settings.get('max_batch_size', 30)
+    resolved_max_tokens = max_tokens if max_tokens is not None else settings.get('max_tokens')
 
     # Build provider options
     provider_options = _build_provider_options(
@@ -318,6 +321,8 @@ def translate_with_config(
         top_p=top_p,
         settings_model_params=settings.get('model_params')
     )
+    if resolved_max_tokens:
+        provider_options['max_tokens'] = int(resolved_max_tokens)
 
     # Generate output path if not specified
     if output_path:
@@ -346,6 +351,7 @@ def translate_with_config(
     print(f"[SERVICE]   Source: {source_lang} -> Target: {target_lang}", file=sys.stderr)
     print(f"[SERVICE]   Tone: {tone}", file=sys.stderr)
     print(f"[SERVICE]   Max batch size: {resolved_max_batch_size}", file=sys.stderr)
+    print(f"[SERVICE]   Max tokens: {resolved_max_tokens or 'auto (provider default)'}", file=sys.stderr)
     print(f"[SERVICE]   Scene threshold: {resolved_scene_threshold}s", file=sys.stderr)
     print(f"[SERVICE]   Stream: {stream}", file=sys.stderr)
     print(f"[SERVICE]   Provider options: {provider_options}", file=sys.stderr)
