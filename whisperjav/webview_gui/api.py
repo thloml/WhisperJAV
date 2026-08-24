@@ -3943,6 +3943,8 @@ class WhisperJAVAPI:
                 args.extend(["--max-batch-size", str(options['max_batch_size'])])
             if options.get('max_tokens'):
                 args.extend(["--max-tokens", str(options['max_tokens'])])
+            if options.get('parallel_files') and int(options['parallel_files']) > 1:
+                args.extend(["--parallel-files", str(int(options['parallel_files']))])
             if options.get('max_retries'):
                 args.extend(["--max-retries", str(options['max_retries'])])
             # Output directory — honor the shared Destination section.

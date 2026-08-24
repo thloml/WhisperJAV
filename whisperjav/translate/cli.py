@@ -56,6 +56,7 @@ _check_translate_dependencies()
 import argparse
 import logging
 import os
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Optional
 
@@ -304,6 +305,14 @@ def main():
         help=f"Max batch size (default: {settings.get('max_batch_size', 30)})"
     )
     process_group.add_argument(
+        '--parallel-files',
+        type=int,
+        default=1,
+        help="Translate multiple input SRT files concurrently (file-level parallelism). "
+             "1 = sequential (default). Only applies to cloud/Ollama providers; "
+             "'local' always runs sequentially on its single embedded server."
+    )
+    process_group.add_argument(
         '--translate-gpu-layers',
         type=int,
         default=-1,
@@ -548,6 +557,9 @@ def main():
     # Build extra context
     extra_context = build_extra_context(args)
 
+    # File-level parallelism: number of concurrent translation workers.
+    parallel_files = max(1, getattr(args, 'parallel_files', 1) or 1)
+
     # =========================================================================
     # DIAGNOSTIC: CLI Configuration Summary
     # =========================================================================
@@ -562,6 +574,7 @@ def main():
     print(f"  Scene threshold: {merged.get('scene_threshold', 60.0)}s", file=sys.stderr)
     print(f"  Max batch size: {merged.get('max_batch_size', 30)}", file=sys.stderr)
     print(f"  Max tokens: {provider_options.get('max_tokens', 'auto (provider default)')}", file=sys.stderr)
+    print(f"  Parallel files: {parallel_files}", file=sys.stderr)
     if instruction_file:
         print(f"  Instructions: {instruction_file}", file=sys.stderr)
     print(f"  Provider options: {provider_options}", file=sys.stderr)
@@ -683,8 +696,12 @@ def main():
     success_count = 0
     fail_count = 0
 
-    for i, input_path in enumerate(files_to_process):
-        # Determine output path for this file
+    # File-level parallelism: each input file is an independent PySubtrans
+    # project (own .subtrans resume state, batches, output), so multiple files
+    # can translate concurrently without touching each other's state. Only the
+    # provider API is shared — 429s are handled by the existing max_retries.
+    def _compute_output_path(input_path: Path) -> Path:
+        """Determine the output SRT path for a single input file."""
         if hasattr(args, 'output') and args.output:
             # If explicit output provided:
             # - If it's a directory (or looks like one): generate filename inside it
@@ -695,13 +712,110 @@ def main():
                     out_arg.mkdir(parents=True, exist_ok=True)
                 # Output filename is same as generated one but in the specified dir
                 default_name = Path(generate_output_path(str(input_path), target_lang)).name
-                output_path = out_arg / default_name
-            else:
-                # Single file mode with explicit file path
-                output_path = out_arg
-        else:
-            # Auto-generate
-            output_path = Path(generate_output_path(str(input_path), target_lang))
+                return out_arg / default_name
+            return out_arg
+        # Auto-generate
+        return Path(generate_output_path(str(input_path), target_lang))
+
+    def _translate_pysubtrans(input_path: Path, output_path: Path) -> Optional[Path]:
+        """Translate one file through PySubtrans (Ollama or cloud provider)."""
+        if provider_name == 'ollama':
+            return translate_subtitle(
+                input_path=str(input_path),
+                output_path=output_path,
+                provider_config=provider_config,
+                model=model,
+                api_key='',
+                source_lang=source_lang,
+                target_lang=target_lang,
+                instruction_file=instruction_file,
+                scene_threshold=merged.get('scene_threshold', 60.0),
+                max_batch_size=ollama_batch_size,
+                stream=True,  # Always stream for local models (prevents timeout)
+                debug=args.debug,
+                provider_options=provider_options,
+                extra_context=extra_context if extra_context else None,
+                emit_raw_output=not getattr(args, 'no_progress', False)
+            )
+        return translate_subtitle(
+            input_path=str(input_path),
+            output_path=output_path,
+            provider_config=provider_config,
+            model=model,
+            api_key=api_key,
+            source_lang=source_lang,
+            target_lang=target_lang,
+            instruction_file=instruction_file,
+            scene_threshold=merged.get('scene_threshold', 60.0),
+            max_batch_size=merged.get('max_batch_size', 30),
+            stream=args.stream if hasattr(args, 'stream') else False,
+            debug=args.debug,
+            provider_options=provider_options,
+            extra_context=extra_context if extra_context else None,
+            emit_raw_output=not getattr(args, 'no_progress', False)
+        )
+
+    def _translate_worker(i: int, input_path: Path) -> bool:
+        """Translate one file as a parallel worker. Returns True on success."""
+        output_path = _compute_output_path(input_path)
+        try:
+            if not args.no_progress:
+                if i > 0 and len(files_to_process) > 1:
+                    print(file=sys.stderr)  # Blank line between files
+                print(f"Translating [{i+1}/{len(files_to_process)}]: {input_path.name}", file=sys.stderr)
+                if i == 0:  # Only print provider info once
+                    print(f"Provider: {provider_name} ({model})", file=sys.stderr)
+
+            result_path = _translate_pysubtrans(input_path, output_path)
+
+            if result_path:
+                # Print output path to stdout (for capture by calling process)
+                print(str(result_path))
+                if not args.no_progress:
+                    print(f"Complete: {result_path.name}", file=sys.stderr)
+                return True
+            print(f"Failed: {input_path.name}", file=sys.stderr)
+            return False
+        except KeyboardInterrupt:
+            raise
+        except Exception as e:
+            print(f"Error translating {input_path.name}: {e}", file=sys.stderr)
+            if args.debug:
+                import traceback
+                traceback.print_exc()
+            return False
+
+    # Parallel (file-level) — cloud/Ollama only. The embedded 'local' provider
+    # starts/stops a single server and must stay sequential.
+    if provider_name == 'local' and parallel_files > 1:
+        print(f"[CLI] NOTE: --parallel-files is ignored for --provider local "
+              f"(single embedded LLM server runs sequentially)", file=sys.stderr)
+
+    if provider_name != 'local' and parallel_files > 1:
+        print(f"\n[CLI] Translating {len(files_to_process)} files in parallel "
+              f"(workers={parallel_files})...", file=sys.stderr)
+        with ThreadPoolExecutor(max_workers=parallel_files, thread_name_prefix='wjav-translate') as executor:
+            futures = {executor.submit(_translate_worker, i, p): p
+                       for i, p in enumerate(files_to_process)}
+            try:
+                for fut in as_completed(futures):
+                    if fut.result():
+                        success_count += 1
+                    else:
+                        fail_count += 1
+            except KeyboardInterrupt:
+                print("\nBatch translation interrupted", file=sys.stderr)
+                for fut in futures:
+                    fut.cancel()
+                executor.shutdown(wait=False, cancel_futures=True)
+                # Exit immediately: running workers are blocked in HTTP calls
+                # and the ThreadPoolExecutor would otherwise wait for them.
+                os._exit(1)
+        # All files were handled above; make the sequential loop below a no-op.
+        files_to_process = []
+
+    for i, input_path in enumerate(files_to_process):
+        output_path = _compute_output_path(input_path)
 
         try:
             if not args.no_progress:
@@ -796,42 +910,8 @@ def main():
                         print(f"\n[CLI] Stopping local LLM server...", file=sys.stderr)
                         stop_local_server()
                         print(f"[CLI]   Server stopped, GPU memory released", file=sys.stderr)
-            elif provider_name == 'ollama':
-                result_path = translate_subtitle(
-                    input_path=str(input_path),
-                    output_path=output_path,
-                    provider_config=provider_config,
-                    model=model,
-                    api_key='',
-                    source_lang=source_lang,
-                    target_lang=target_lang,
-                    instruction_file=instruction_file,
-                    scene_threshold=merged.get('scene_threshold', 60.0),
-                    max_batch_size=ollama_batch_size,
-                    stream=True,  # Always stream for local models (prevents timeout)
-                    debug=args.debug,
-                    provider_options=provider_options,
-                    extra_context=extra_context if extra_context else None,
-                    emit_raw_output=not getattr(args, 'no_progress', False)
-                )
             else:
-                result_path = translate_subtitle(
-                    input_path=str(input_path),
-                    output_path=output_path,
-                    provider_config=provider_config,
-                    model=model,
-                    api_key=api_key,
-                    source_lang=source_lang,
-                    target_lang=target_lang,
-                    instruction_file=instruction_file,
-                    scene_threshold=merged.get('scene_threshold', 60.0),
-                    max_batch_size=merged.get('max_batch_size', 30),
-                    stream=args.stream if hasattr(args, 'stream') else False,
-                    debug=args.debug,
-                    provider_options=provider_options,
-                    extra_context=extra_context if extra_context else None,
-                    emit_raw_output=not getattr(args, 'no_progress', False)
-                )
+                result_path = _translate_pysubtrans(input_path, output_path)
 
             if result_path:
                 # Print output path to stdout (for capture by calling process)

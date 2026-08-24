@@ -6912,7 +6912,7 @@ const TranslatorManager = {
         'translatorTone', 'translatorMovieTitle', 'translatorNames',
         'translatorPlot', 'translatorSceneThreshold', 'translatorMaxBatchSize',
         'translatorMaxTokens', 'translatorMaxRetries', 'translatorRateLimit',
-        'translatorCustomEndpoint'
+        'translatorParallelFiles', 'translatorCustomEndpoint'
     ],
     _saveTimer: null,
 
@@ -7146,6 +7146,7 @@ const TranslatorManager = {
             max_batch_size: parseInt(document.getElementById('translatorMaxBatchSize')?.value) || 30,
             max_tokens: document.getElementById('translatorMaxTokens')?.value ?
                        parseInt(document.getElementById('translatorMaxTokens').value) : null,
+            parallel_files: parseInt(document.getElementById('translatorParallelFiles')?.value) || 1,
             rate_limit: document.getElementById('translatorRateLimit')?.value ?
                        parseInt(document.getElementById('translatorRateLimit').value) : null,
             max_retries: parseInt(document.getElementById('translatorMaxRetries')?.value) || 3,

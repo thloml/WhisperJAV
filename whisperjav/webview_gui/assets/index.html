@@ -1077,6 +1077,11 @@
                                             <label for="translatorRateLimit" class="form-label">Rate Limit (req/min):</label>
                                             <input type="number" id="translatorRateLimit" class="form-input" placeholder="No limit" min="1" max="1000">
                                         </div>
+                                        <div class="form-group">
+                                            <label for="translatorParallelFiles" class="form-label">Parallel Files:</label>
+                                            <input type="number" id="translatorParallelFiles" class="form-input" value="1" min="1" max="8"
+                                                   title="Translate multiple selected SRT files concurrently (file-level parallelism). Cloud providers only.">
+                                        </div>
                                         <div class="form-group" style="grid-column: span 2;">
                                             <label for="translatorCustomEndpoint" class="form-label">Custom Endpoint URL:</label>
                                             <input type="text" id="translatorCustomEndpoint" class="form-input" placeholder="https://api.example.com/v1 (for OpenAI-compatible APIs)">
