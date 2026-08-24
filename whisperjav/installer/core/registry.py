@@ -432,6 +432,14 @@ PACKAGES: List[Package] = [
         required=True,
         reason="CTranslate2-based Whisper for 4x faster inference",
     ),
+    Package(
+        name="ctranslate2",
+        version="==4.6.2",
+        extra=Extra.CORE,
+        order=34,
+        required=True,
+        reason="Pinned to the source-built ROCm fork (scripts/build_ct2_rocm.sh); prevents uv/pip from swapping in a CPU wheel",
+    ),
 
     # =========================================================================
     # PHASE 5: Audio/CLI Packages (Order 40-49)
