@@ -133,6 +133,7 @@ def load_pipeline_config(yaml_path: str) -> Dict[str, Any]:
         "scene_detector": "scene_detector",
         "scene_min_duration": "scene_min_duration",
         "scene_max_duration": "scene_max_duration",
+        "scene_clustering_threshold": "scene_clustering_threshold",
         "speech_enhancer": "speech_enhancer",
         "speech_enhancer_model": "speech_enhancer_model",
         "speech_segmenter": "speech_segmenter",
@@ -194,6 +195,7 @@ class DecoupledPipeline(BasePipeline):
         safe_chunking: bool = True,
         scene_min_duration: float = 12.0,
         scene_max_duration: float = 48.0,
+        scene_clustering_threshold: Optional[float] = None,  # v1.9.2: semantic only; None = the engine default (22 since O1)
 
         # Speech enhancement (Phase 3)
         speech_enhancer: str = "none",
@@ -259,6 +261,7 @@ class DecoupledPipeline(BasePipeline):
         self.safe_chunking = safe_chunking
         self.scene_min_duration = scene_min_duration
         self.scene_max_duration = scene_max_duration
+        self.scene_clustering_threshold = scene_clustering_threshold
 
         # Speech enhancement config
         self.enhancer_backend = speech_enhancer
@@ -391,6 +394,11 @@ class DecoupledPipeline(BasePipeline):
         Returns:
             Master metadata dictionary with paths, stats, quality metrics.
         """
+        # Cross-cutting rule of the agreed error-handling table (2026-09-17):
+        # anything that quietly fell short is reported in the run summary rather
+        # than only in the log. Reset per file -- the pipeline object is reused
+        # across the whole run.
+        self.degradations = []
         input_file = Path(media_info["path"])
         media_basename = media_info["basename"]
         pipeline_start = time.time()
@@ -459,6 +467,9 @@ class DecoupledPipeline(BasePipeline):
                 os.getpid(), self.scene_min_duration, self.scene_max_duration,
             )
 
+        if self.scene_clustering_threshold is not None:
+            scene_detector_kwargs["clustering_threshold"] = float(self.scene_clustering_threshold)
+
         scene_detector = SceneDetectorFactory.safe_create_from_legacy_kwargs(**scene_detector_kwargs)
         result = scene_detector.detect_scenes(extracted_audio, scenes_dir, media_basename)
         scene_paths = result.to_legacy_tuples()
@@ -522,6 +533,7 @@ class DecoupledPipeline(BasePipeline):
             enhanced_paths = enhance_scenes(
                 scene_paths, enhancer, self.temp_dir,
                 progress_callback=_enhancement_progress,
+                degradations=self.degradations,
             )
             original_16k_paths = resample_scenes(scene_paths, self.temp_dir)
 
@@ -554,6 +566,7 @@ class DecoupledPipeline(BasePipeline):
             scene_paths = enhance_scenes(
                 scene_paths, enhancer, self.temp_dir,
                 progress_callback=_enhancement_progress,
+                degradations=self.degradations,
             )
 
             # VRAM Block 1 cleanup — release enhancer before loading ASR
@@ -659,6 +672,10 @@ class DecoupledPipeline(BasePipeline):
             scene_speech_regions=orch_speech_regions,
             vad_audio_paths=orch_vad_paths,
         )
+
+        # A failed aligner load no longer ends the job (#436); say so in the summary.
+        if getattr(self._subtitle_pipeline, "alignment_unavailable", None):
+            self.degradations.append(self._subtitle_pipeline.alignment_unavailable)
 
         # Convert to Phase 6 format: (WhisperResult, scene_idx)
         scene_results: List[Tuple[Optional[stable_whisper.WhisperResult], int]] = []
@@ -839,6 +856,10 @@ class DecoupledPipeline(BasePipeline):
         total_time = time.time() - pipeline_start
         master_metadata["total_time_sec"] = total_time
         master_metadata["summary"]["total_processing_time_seconds"] = round(total_time, 2)
+        # Carried out with the rest of the summary so every caller sees it
+        # the same way: the plain path, the async path, and a pass running in
+        # its own process (agreed error-handling table, 2026-09-17).
+        master_metadata["summary"]["degradations"] = list(getattr(self, "degradations", None) or [])
 
         logger.info(
             "[DecoupledPipeline PID %s] Complete: %s (%d subtitles in %s)",

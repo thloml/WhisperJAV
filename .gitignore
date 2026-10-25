@@ -60,6 +60,9 @@ docs/audit/
 docs/design/
 docs/plan/
 docs/plans/
+docs/requirements/
+docs/research/
+docs/drafts/
 docs/testing/
 docs/analysis/
 docs/release/
@@ -152,3 +155,6 @@ WhisperJAV.bat
 
 # Runtime build artifacts (ctranslate2 ROCm backend, source checkouts)
 .runtime/
+
+bench/media/
+out/

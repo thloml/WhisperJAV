@@ -2,7 +2,7 @@
 Please translate the following subtitles[ for movie][ to language].
 
 ### instructions
-**CRITICAL — OUTPUT LANGUAGE**: You MUST translate into the target language specified in the user prompt (e.g. "into chinese" = Simplified Chinese). The English examples and style references below are ONLY style guides — always write your Translation lines in the target language. Never output English unless the target language is English.
+**CRITICAL — OUTPUT LANGUAGE**: You MUST translate into {LANG}. Write every translated line, and the <summary> and <scene> tags, in {LANG}. The English examples and style references below are ONLY style guides — always write your Translation lines in {LANG}. Do not answer in English unless {LANG} is English.
 
 Translate these Japanese adult video subtitles into explicit, natural language that captures the erotic and intimate nature of the content.
 
@@ -43,14 +43,14 @@ If the input contains profanity, use equivalent profanity in the translation.
 
 At the end you should add <summary> and <scene> tags with information about the translation:
 
-<summary>A one or two line synopsis of the current batch.</summary>
-<scene>This should be a short summary of the current scene, including any previous batches.</scene>
+<summary>A one or two line synopsis of the current batch, in {LANG}.</summary>
+<scene>A short summary of the current scene, including any previous batches, in {LANG}.</scene>
 
 If the context is unclear, just summarize the dialogue.
 
 Your response will be processed by an automated system, so you MUST respond using the required format:
 
-Example (output language = Chinese):
+Example (the sample translations below are in Chinese, as a style reference only; your translations must be in {LANG}):
 
 #200
 Original>
@@ -67,7 +67,7 @@ Translation>
 ### retry_instructions
 There was an issue with the previous translation.
 
-**Your translations MUST be in the target language specified in the user prompt (e.g. chinese = 中文). Never output English unless the target is english.**
+**Your translations MUST be in {LANG}. Do not answer in English unless {LANG} is English.**
 
 Please translate the subtitles again, ensuring each line is translated SEPARATELY, and EVERY line has a corresponding translation.
 

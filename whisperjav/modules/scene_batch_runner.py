@@ -83,8 +83,15 @@ class SceneBatchRunner:
 
         self._scenes_processed = 0
         self._proc = None
+        # 1-based worker generation: bumped on every spawn. Generation N means
+        # the model has been loaded N times; generation - 1 is how many times
+        # the recogniser was replaced (scene budget, RSS ceiling, or a crash).
+        self._generation = 0
 
-    # ------------------------------------------------------------------ lifecycle
+    @property
+    def worker_recycles(self) -> int:
+        """Times the worker (and its loaded model) was replaced during this runner's life."""
+        return max(0, self._generation - 1)
     def transcribe_batch(self, batch_path):
         """Send one batch to the worker and return its parsed results list.
 
@@ -105,6 +112,11 @@ class SceneBatchRunner:
             resp = self._read_done()
             if resp is not None:
                 results = self._load_results(batch_path)
+                # Stamp every scene with the worker generation that decoded it
+                # (read before any recycle below, so it names the right worker).
+                for _item in results:
+                    if isinstance(_item, dict):
+                        _item["worker_epoch"] = self._generation
                 self._scenes_processed += resp.get("scenes", 0)
                 rss_mb = int(resp.get("rss_mb", 0) or 0)
                 if self._scenes_processed >= self.max_scenes or rss_mb >= self.max_rss_mb:
@@ -127,6 +139,7 @@ class SceneBatchRunner:
 
     # ------------------------------------------------------------------ internals
     def _spawn(self):
+        self._generation += 1
         self._proc = subprocess.Popen(
             [sys.executable, "-m", "whisperjav.modules.scene_batch_worker",
              str(self.out_dir), self.task, self.cfg_path, str(self.max_scenes)],

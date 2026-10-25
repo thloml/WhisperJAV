@@ -28,6 +28,7 @@ import json
 import os
 import resource
 import sys
+import time
 from pathlib import Path
 
 
@@ -100,6 +101,7 @@ def main() -> int:
         for scene in batch:
             scene_path = Path(scene)
             srt_path = out_dir / f"{scene_path.stem}.srt"
+            scene_t0 = time.time()
             try:
                 asr.transcribe_to_srt(scene_path, srt_path, task=task)
                 results.append({
@@ -108,6 +110,13 @@ def main() -> int:
                     "srt": str(srt_path),
                     "vad": getattr(asr, "get_last_vad_segments", lambda: [])() or [],
                     "filter_stats": asr.get_filter_statistics(),
+                    # v1.9.2 diagnostics surface (merged from upstream): consumed
+                    # by the pipeline's per-scene report and ASR telemetry.
+                    "segmenter": (asr.get_segmenter_name()
+                                  if hasattr(asr, "get_segmenter_name") else "none"),
+                    "decode_stats": (asr.get_last_decode_stats()
+                                     if hasattr(asr, "get_last_decode_stats") else []),
+                    "wall_s": time.time() - scene_t0,
                 })
                 ok_count += 1
             except Exception as e:
@@ -117,6 +126,11 @@ def main() -> int:
                     "error": str(e),
                     "vad": [],
                     "filter_stats": {},
+                    "segmenter": (asr.get_segmenter_name()
+                                  if hasattr(asr, "get_segmenter_name") else "none"),
+                    "decode_stats": [],
+                    # The time was really spent, so report it even on failure.
+                    "wall_s": time.time() - scene_t0,
                 })
 
         results_path = out_dir / f"{batch_path.stem}.results.json"

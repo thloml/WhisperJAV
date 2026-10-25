@@ -46,8 +46,15 @@ DEFAULT_GUI_SETTINGS = {
     "output_dir": "",
     "debug_logging": False,
     "keep_temp": False,
+    "skip_existing": False,
+    "remember_settings": False,
+    "fail_on_empty": False,
+    "fail_on_suspect": False,
+    "asr_telemetry": True,
+    "model_refresh_audio_minutes": 20,
     "temp_dir": "",
     "accept_cpu_mode": False,
+    "offline_mode": False,
     "async_processing": False,
 
     # Performance tunables (Tab 2 Advanced) — persisted so the user's chosen
@@ -56,19 +63,21 @@ DEFAULT_GUI_SETTINGS = {
     "max_worker_rss_pct": 50,
 
     # Tab 3 — Ensemble  (values MUST match index.html `selected` attrs)
-    "pass1_pipeline": "anime-whisper",
+    # v1.9.5 (owner, 2026-10-12): pass 1 Qwen3-ASR + FireRedVAD, pass 2
+    # Anime-Whisper + TEN VAD, both aggressive; pass 2 off by default.
+    "pass1_pipeline": "qwen",
     "pass1_sensitivity": "aggressive",
     "pass1_scene_detector": "semantic",
     "pass1_speech_enhancer": "none",
-    "pass1_speech_segmenter": "whisperseg",
-    "pass1_model": "litagin/anime-whisper",
+    "pass1_speech_segmenter": "firered-vad",
+    "pass1_model": "Qwen/Qwen3-ASR-1.7B",
     "pass2_enabled": False,
-    "pass2_pipeline": "qwen",
-    "pass2_sensitivity": "balanced",
+    "pass2_pipeline": "anime-whisper",
+    "pass2_sensitivity": "aggressive",
     "pass2_scene_detector": "semantic",
     "pass2_speech_enhancer": "none",
     "pass2_speech_segmenter": "ten",
-    "pass2_model": "Qwen/Qwen3-ASR-1.7B",
+    "pass2_model": "litagin/anime-whisper",
     "merge_strategy": "pass1_primary",
     "pass1_preset": "",
     "pass2_preset": "",
@@ -84,7 +93,34 @@ def get_gui_settings_path() -> Path:
     else:
         base = Path.home() / ".config"
 
-    return (base / "WhisperJAV" / "gui_settings.json").expanduser()
+    path = (base / "WhisperJAV" / "gui_settings.json").expanduser()
+    try:
+        return path.resolve()
+    except OSError:
+        return path
+
+
+def atomic_write_json(path, payload, logger_=None) -> None:
+    """Write payload as JSON atomically; fall back to direct write on OSError (#309)."""
+    import json as _json
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        _json.dump(payload, f, indent=2, ensure_ascii=False)
+        f.flush()
+        os.fsync(f.fileno())
+    try:
+        os.replace(tmp_path, path)
+    except OSError as exc:
+        if logger_ is not None:
+            logger_.warning("Atomic replace failed for %s (%s); direct write", path, exc)
+        with open(path, "w", encoding="utf-8") as f:
+            _json.dump(payload, f, indent=2, ensure_ascii=False)
+        try:
+            tmp_path.unlink()
+        except OSError:
+            pass
 
 
 def _rotate_backups(settings_path: Path) -> Optional[Path]:
@@ -229,19 +265,8 @@ def save_gui_settings(settings: dict) -> bool:
         existing["version"] = SETTINGS_SCHEMA_VERSION
         existing["_comment"] = DEFAULT_GUI_SETTINGS["_comment"]
 
-        settings_path.parent.mkdir(parents=True, exist_ok=True)
-
-        # Atomic write: .tmp → rename
-        tmp_path = settings_path.with_suffix(".json.tmp")
-        with open(tmp_path, "w", encoding="utf-8") as f:
-            json.dump(existing, f, indent=2, ensure_ascii=False)
-            f.flush()
-            os.fsync(f.fileno())
-
-        # On Windows, rename fails if target exists — remove first
-        if settings_path.exists():
-            settings_path.unlink()
-        tmp_path.rename(settings_path)
+        # Atomic write with junction-safe fallback (#309)
+        atomic_write_json(settings_path, existing, logger_=logger)
 
         logger.debug("GUI settings saved to %s", settings_path)
         return True

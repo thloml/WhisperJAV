@@ -327,7 +327,16 @@ pip install "pywebview>=5.0.0" "pythonnet>=3.0" "pywin32>=305"
 
 REM Speech Enhancement
 pip install "modelscope>=1.20" oss2 addict "datasets>=2.14.0,<4.0" simplejson sortedcontainers packaging
-pip install git+https://github.com/meizhong986/ClearerVoice-Studio.git#subdirectory=clearvoice
+
+REM ClearerVoice's own transitive dependencies, installed explicitly because the
+REM next command uses --no-deps (this mirrors what the standalone installer does).
+pip install gdown joblib torchinfo yamlargparse "opencv-python>=4.10.0" "python-speech-features>=0.6" "rotary-embedding-torch>=0.8" "scenedetect>=0.6"
+
+REM --no-deps is required: ClearerVoice declares an unpinned torch, and without it
+REM pip replaces your CUDA build with the CPU wheel from PyPI, silently disabling
+REM GPU acceleration for the whole install (#334).
+pip install --no-deps git+https://github.com/meizhong986/ClearerVoice-Studio.git#subdirectory=clearvoice
+
 pip install bs-roformer-infer "onnxruntime>=1.16.0"
 
 REM Compatibility (pyvideotrans interop)
@@ -556,7 +565,12 @@ This re-runs the full installer, which will upgrade packages as needed.
 REM Upgrade WhisperJAV only (no dependency changes)
 pip install -U --no-deps git+https://github.com/meizhong986/whisperjav.git
 
-REM Upgrade with all dependencies (may change PyTorch -- use with caution)
+REM Upgrade with all dependencies -- NOT RECOMMENDED ON A GPU INSTALL
+REM On Windows, PyPI serves the CPU-only build of PyTorch (the CUDA builds are
+REM only on download.pytorch.org), so any resolution that touches PyTorch will
+REM replace your GPU build with a CPU one, silently. It can also move other
+REM pinned packages. Prefer "whisperjav-upgrade", which passes constraints that
+REM protect the GPU packages.
 pip install -U "whisperjav[all] @ git+https://github.com/meizhong986/whisperjav.git"
 ```
 

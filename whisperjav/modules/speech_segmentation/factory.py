@@ -66,7 +66,7 @@ _BACKEND_DEPENDENCIES: Dict[str, Dict[str, Any]] = {
         "install_hint": "pip install whisperjav[whisperseg] (or whisperjav[whisperseg-gpu] for CUDA)",
         "always_available": False,
     },
-    # v1.9.0 EXPERIMENTAL. Exact key required: the base-name fallback below
+    # v1.9.0 (installed by default since v1.9.2). Exact key required: the base-name fallback below
     # would otherwise resolve "firered-vad" to unknown base "firered".
     "firered-vad": {
         "packages": ["fireredvad"],
@@ -163,6 +163,8 @@ _PARAM_SCHEMAS = {
         "grow_floor":              (float, 0.05, False),   # v1.9.0 offline: edge-growth floor (capture-vs-cut dial)
         "gap_merge_ms":            (int,   350,  False),   # v1.9.0 offline: gaps >= this become cuts; shorter merge
         "split_smooth_ms":         (int,   120,  False),   # v1.9.0 offline: smoothing window for overlong-split minima
+        "dip_search_from":         (float, 0.6,  False),   # v1.9.4 hysteresis "dip" split: search start (fraction)
+        "dip_accept_any":          (bool,  False, False),  # v1.9.4 hysteresis "dip" split: cut at the lowest point always
         "min_speech_duration_ms":  (int,   100,  False),
         "min_silence_duration_ms": (int,   100,  False),
         "speech_pad_ms":           (int,   300,  False),  # Symmetric fallback for start/end pad
@@ -174,7 +176,7 @@ _PARAM_SCHEMAS = {
         "force_cpu":               (bool,  False, False),
         "num_threads":             (int,   1,    False),
     },
-    # v1.9.0 EXPERIMENTAL: FireRedVAD (DFSMN, ~0.6M params). Detection defaults
+    # v1.9.0 FireRedVAD (DFSMN, ~0.6M params); installed by default since v1.9.2. Detection defaults
     # mirror upstream README (speech_threshold 0.4, min speech/silence 200ms);
     # max_speech is JAV-capped at 6s (upstream default 20s produced ~9s segments
     # in owner testing — JAV utterances rarely exceed ~5s). Upstream splits
@@ -191,6 +193,9 @@ _PARAM_SCHEMAS = {
         "chunk_threshold_s":       (float, 1.0,   True),
         "max_group_duration_s":    (float, 6.0,   True),
         "use_gpu":                 (bool,  False, False),
+        # A model directory the user downloaded themselves. Nullable with no
+        # default: absent or None means "use the cache, then download".
+        "model_dir":               (str,   None,  True),
     },
 }
 
@@ -284,7 +289,7 @@ class SpeechSegmenterFactory:
             "silero-v6.2": "Silero VAD v6.2",
             "ten": "TEN VAD",
             "whisperseg": "WhisperSeg (JA-ASMR)",
-            "firered-vad": "FireRedVAD (experimental)",
+            "firered-vad": "FireRedVAD",
             "none": "None (Skip)",
         }
 

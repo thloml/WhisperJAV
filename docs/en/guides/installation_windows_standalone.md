@@ -53,7 +53,7 @@ WhisperJAV uses NVIDIA CUDA for GPU-accelerated transcription. The installer aut
 | 450 - 569 | CUDA 11.8 (universal) | All CUDA-capable NVIDIA GPUs |
 | No NVIDIA GPU | CPU-only (slower) | Any system (6-10x slower than GPU) |
 
-If you do not have an NVIDIA GPU, WhisperJAV will still work in CPU-only mode. Processing will be slower (approximately 30-60 minutes per hour of video, compared to 5-10 minutes with a GPU).
+If you do not have an NVIDIA GPU, WhisperJAV will still work in CPU-only mode: tick **Accept CPU-only mode** on the GUI's Advanced tab (or pass `--accept-cpu-mode` on the command line). Without it, the start-up check stops and asks whether to continue on the CPU, and in the GUI the run aborts with a message telling you to tick that box. Processing will be slower (approximately 30-60 minutes per hour of video, compared to 5-10 minutes with a GPU).
 
 ### Supported NVIDIA GPUs
 
@@ -151,7 +151,7 @@ You can change this to any location. Keep these guidelines in mind:
 ### Step 6: Installation Options
 
 The installer will show optional settings:
-- **Add to PATH:** Enabled by default. Allows running `whisperjav` from the command line and enables future upgrades via `pip install -U`.
+- **Add to PATH:** Enabled by default. Allows running `whisperjav` from the command line and enables future upgrades via `whisperjav-upgrade`.
 - **Create shortcuts:** Creates a desktop shortcut for easy access.
 
 Click "Install" to begin.
@@ -282,6 +282,15 @@ This file contains detailed information about every step of the installation pro
 
 ## Upgrading from a Previous Version
 
+### Which version are you on?
+
+- **On v1.9.2** — either works. Upgrade, or do a fresh install. v1.9.3 changes no underlying
+  library; the only new package is `demucs`, for htdemucs vocal isolation.
+- **On anything older than v1.9.2** — **do a fresh install.** v1.9.2 pinned Faster-Whisper to an
+  exact commit and CTranslate2 to 4.8.1, and an in-place upgrade from an older version can leave
+  your previous versions of those behind. A fresh install puts you on the combination the release
+  was tested with.
+
 ### Automatic Upgrade Detection
 
 If you install WhisperJAV v1.8.9 to the same directory as a previous version, the installer will:
@@ -297,8 +306,19 @@ Your user configuration in `%APPDATA%\WhisperJAV` is preserved during upgrades.
 If you have PATH enabled (the default), you can upgrade without re-downloading the installer:
 
 ```cmd
-pip install -U "whisperjav[all] @ git+https://github.com/meizhong986/whisperjav.git"
+whisperjav-upgrade
 ```
+
+**Do not upgrade with a plain `pip install -U whisperjav...`.** On Windows, PyPI serves the
+**CPU-only** build of PyTorch; the CUDA builds are only on `download.pytorch.org`. Any resolution
+that touches PyTorch will therefore replace your GPU build with a CPU one, silently. The same
+command also moves other pinned packages around. `whisperjav-upgrade` passes constraints that
+protect the GPU packages.
+
+> **Upgrading to v1.9.3:** `whisperjav-upgrade` does not install the optional groups, so it will not
+> bring `demucs` (new in v1.9.3, for htdemucs vocal isolation). If you want htdemucs, run
+> `pip install demucs` once afterwards. Choosing htdemucs without it stops the run with a clear
+> message rather than failing quietly.
 
 ### Preserving Configuration
 
@@ -513,7 +533,7 @@ cmd /C START /WAIT WhisperJAV-1.8.9-Windows-x86_64.exe /S /AddToPath=0 /InstallL
 
 ### Q: Do I need an NVIDIA GPU?
 
-**A:** No. WhisperJAV works on any Windows 10/11 system. Without an NVIDIA GPU, it runs in CPU-only mode, which is approximately 6-10 times slower. For occasional use, CPU mode is perfectly fine. For regular use or long videos, an NVIDIA GPU is strongly recommended.
+**A:** No. WhisperJAV works on any Windows 10/11 system. Without an NVIDIA GPU, it runs in CPU-only mode once you tick **Accept CPU-only mode** (Advanced tab); the start-up check otherwise stops and asks. CPU mode is approximately 6-10 times slower. For occasional use, CPU mode is perfectly fine. For regular use or long videos, an NVIDIA GPU is strongly recommended.
 
 ### Q: How much disk space do I need?
 
@@ -533,7 +553,7 @@ cmd /C START /WAIT WhisperJAV-1.8.9-Windows-x86_64.exe /S /AddToPath=0 /InstallL
 
 ### Q: How do I update to a newer version?
 
-**A:** Download and run the new installer. If you install to the same directory, the installer will detect the previous version and offer to replace it. Your user settings are preserved. Alternatively, if PATH was enabled, run: `pip install -U "whisperjav[all] @ git+https://github.com/meizhong986/whisperjav.git"`
+**A:** Download and run the new installer. If you install to the same directory, the installer will detect the previous version and offer to replace it. Your user settings are preserved. Alternatively, if PATH was enabled, run `whisperjav-upgrade`, which protects your GPU PyTorch while it works. Do not use a plain `pip install -U whisperjav...`: on Windows, PyPI serves the CPU-only build of PyTorch, so it can silently replace your GPU build.
 
 ### Q: What video formats are supported?
 

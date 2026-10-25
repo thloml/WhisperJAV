@@ -21,6 +21,19 @@ if os.name == 'nt' and not getattr(sys.flags, 'utf8_mode', False):
     from whisperjav.utils.console import relaunch_for_utf8
     relaunch_for_utf8('whisperjav.cli')
 
+# OFFLINE MODE (#415): must precede patch_hf_hub_downloads(), which imports huggingface_hub.
+from whisperjav.utils.offline_mode import offline_requested as _offline_requested
+if _offline_requested(sys.argv[1:]):
+    from whisperjav.utils.offline_mode import enable_offline_mode
+    enable_offline_mode()
+
+# huggingface_hub reads HF_ENDPOINT at import time, so --hf-endpoint acts here too.
+from whisperjav.utils.offline_mode import hf_endpoint_requested as _hf_endpoint_requested
+_requested_endpoint = _hf_endpoint_requested(sys.argv[1:])
+if _requested_endpoint:
+    from whisperjav.utils.offline_mode import enable_hf_endpoint
+    enable_hf_endpoint(_requested_endpoint)
+
 # ===========================================================================
 # EARLY SETUP - Must be before any library imports
 # ===========================================================================
@@ -43,7 +56,9 @@ def main():
         print(f"Current version: {sys.version}")
         sys.exit(1)
 
-    # Check for FFmpeg in PATH (required dependency)
+    # Check for FFmpeg in PATH (required dependency); an installed copy keeps it in <install>\Library\bin (#436)
+    from whisperjav.utils.conda_path import ensure_conda_dirs_on_path
+    ensure_conda_dirs_on_path()
     if shutil.which("ffmpeg") is None:
         print("Error: FFmpeg is not installed or not in PATH")
         print()

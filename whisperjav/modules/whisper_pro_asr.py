@@ -22,7 +22,6 @@ from whisperjav.utils.logger import logger
 from whisperjav.utils.device_detector import get_best_device
 from whisperjav.utils.parameter_tracer import NullTracer
 from whisperjav.modules.segment_filters import SegmentFilterConfig, SegmentFilterHelper
-from whisperjav.modules.vad_failover import should_force_full_transcribe
 from whisperjav.modules.speech_segmentation import SpeechSegmenterFactory
 
 
@@ -56,14 +55,17 @@ class WhisperProASR:
 
         # Determine speech segmenter backend FIRST (needed for firewall below)
         speech_segmenter_config = params.get("speech_segmenter", {})
-        # v1.8.13: default flipped silero-v3.1 -> whisperseg to align with
-        # LEGACY_PIPELINES["fidelity"]["vad"] = "whisperseg" (resolver-level
-        # default). The fallback only fires when speech_segmenter.backend is
-        # not set (e.g., direct module instantiation bypassing the resolver).
-        # v1.8.12 history: aligned with v3.1 to fix prior silent override to
-        # silero-v4.0 — that alignment is preserved by keeping resolver and
-        # fallback in sync.
-        segmenter_backend = speech_segmenter_config.get("backend", "whisperseg")
+        # This engine runs the fidelity pipeline, so its fallback is fidelity's
+        # default segmenter, shared with main.py and the ensemble pass worker
+        # (owner, 2026-09-12: FireRedVAD). The fallback fires only when
+        # speech_segmenter.backend is not set -- an --ensemble fidelity pass that
+        # names no segmenter, or direct module instantiation that bypasses the
+        # resolver. Before 2026-09-12 it was "whisperseg" (v1.8.13), which is why
+        # ensemble fidelity and `--mode fidelity` used to resolve differently.
+        from whisperjav.config.segmenter_presets import FIDELITY_DEFAULT_SEGMENTER
+        segmenter_backend = speech_segmenter_config.get(
+            "backend", FIDELITY_DEFAULT_SEGMENTER
+        )
 
         # v1.9.0 fix (code-review): 'faster-whisper' means "use faster-whisper's
         # NATIVE VAD" — only FasterWhisperProASR can honor it (it intercepts the
@@ -76,9 +78,9 @@ class WhisperProASR:
             logger.warning(
                 "Speech segmenter 'faster-whisper' (native VAD) is only available "
                 "with the balanced pipeline's Faster-Whisper engine; falling back "
-                "to 'whisperseg' for this pipeline."
+                "to '%s' for this pipeline.", FIDELITY_DEFAULT_SEGMENTER
             )
-            segmenter_backend = "whisperseg"
+            segmenter_backend = FIDELITY_DEFAULT_SEGMENTER
 
         # --- CONSTRUCTOR FIREWALL ---
         # The resolver unconditionally produces Silero VAD presets (threshold=0.068,
@@ -232,7 +234,9 @@ class WhisperProASR:
         logger.debug(f"Final Whisper parameters: {final_params}")
         return final_params
 
-    def transcribe(self, audio_path: Union[str, Path], **kwargs) -> Dict:
+    def transcribe(self, audio_path: Union[str, Path],
+                   vad_audio_path: Optional[Union[str, Path]] = None,
+                   **kwargs) -> Dict:
         """Transcribe audio file with internal VAD processing.
 
         Args:
@@ -269,10 +273,52 @@ class WhisperProASR:
             logger.error(f"Failed to read audio file {audio_path}: {e}")
             raise
 
-        audio_duration = len(audio_data) / sample_rate if sample_rate else 0.0
+        # v1.9.3: dual-track ("enhance for VAD only"). The caller may hand us a
+        # SECOND file -- the cleaned-up version of the same audio -- to find the
+        # speech in, while the recogniser still hears the original. Owner,
+        # 2026-09-17. Without it, both jobs read the one file, as before.
+        vad_audio_data = audio_data
+        if vad_audio_path is not None:
+            try:
+                vad_audio_data, vad_sample_rate = sf.read(str(vad_audio_path), dtype='float32')
+                if vad_audio_data.ndim > 1:
+                    vad_audio_data = np.mean(vad_audio_data, axis=1)
+            except Exception as e:
+                logger.error(f"Failed to read the audio to detect speech in "
+                             f"({vad_audio_path}): {e}")
+                raise
+            if vad_sample_rate != sample_rate:
+                # The two tracks must share a clock or every boundary the
+                # detector reports would land in the wrong place in the audio
+                # the recogniser hears.
+                raise ValueError(
+                    f"Dual-track speech detection needs both tracks at the same "
+                    f"sample rate: the audio is {sample_rate} Hz and the "
+                    f"cleaned-up copy is {vad_sample_rate} Hz.")
+            if len(vad_audio_data) != len(audio_data):
+                # Enhancement can round the length by a sample or two; anything
+                # larger means they are not the same recording.
+                if abs(len(vad_audio_data) - len(audio_data)) > sample_rate // 10:
+                    raise ValueError(
+                        f"Dual-track speech detection needs both tracks to be the "
+                        f"same recording: the audio is {len(audio_data)} samples "
+                        f"and the cleaned-up copy is {len(vad_audio_data)}.")
+                logger.debug("Dual-track lengths differ by %d samples; using the "
+                             "cleaned-up copy for detection as given",
+                             abs(len(vad_audio_data) - len(audio_data)))
+            logger.info("Detecting speech in the cleaned-up audio; the recogniser "
+                        "hears the original")
+
+        # v1.9.2 (owner in1): "no segmentation" is honoured up front rather than
+        # inferred from a passthrough segmenter's fabricated whole-clip region.
+        if self.get_segmenter_name() == "none":
+            self._last_vad_segments = []
+            logger.info("Speech segmentation disabled: transcribing the whole clip in one call")
+            all_segments = self._transcribe_full_audio(audio_data)
+            return self._finalise(all_segments)
 
         # Run speech segmentation through the Speech Segmenter contract
-        vad_segments = self._run_speech_segmentation(audio_data, sample_rate)
+        vad_segments = self._run_speech_segmentation(vad_audio_data, sample_rate)
 
         # Store segments for visualization data contract
         self._last_vad_segments = []
@@ -288,53 +334,33 @@ class WhisperProASR:
             total_segments = sum(len(group) for group in vad_segments)
             logger.info(f"Speech segmentation complete: {total_segments} segments in {len(vad_segments)} groups")
 
-        fallback_triggered = False
-
-        # Handle "none" backend case - no segments means transcribe full audio
+        # The segmenter's answer is used as given.
+        #
+        # v1.9.2 (owner in1): the "insufficient coverage" failover that used to sit
+        # here is gone. It discarded the detector's answer and transcribed the whole
+        # clip instead whenever the result looked implausible to it, on a threshold
+        # (480 s) that was a side effect of an unrelated constant rather than a
+        # chosen value. A detector that genuinely finds no speech is now believed --
+        # on this material that is a normal outcome, not a malfunction (#324).
         if not vad_segments:
-            if self._external_segmenter.name == "none":
-                logger.info("Speech segmentation: disabled (none backend) - transcribing full audio directly")
-                all_segments = self._transcribe_full_audio(audio_data)
-            elif should_force_full_transcribe(vad_segments, audio_duration):
-                logger.warning(
-                    "Speech segmentation produced insufficient coverage (segments=%s, duration=%.1fs). "
-                    "Falling back to full-clip transcription.",
-                    0,
-                    audio_duration,
-                )
-                fallback_triggered = True
-                all_segments = self._transcribe_full_audio(audio_data)
-            else:
-                logger.debug(f"No speech detected in {audio_path.name}")
-                return {"segments": [], "text": "", "language": self.whisper_params.get('language', 'ja')}
-        elif should_force_full_transcribe(vad_segments, audio_duration):
-            logger.warning(
-                "Speech segmentation produced insufficient coverage (segments=%s, duration=%.1fs). "
-                "Falling back to full-clip transcription.",
-                sum(len(group or []) for group in (vad_segments or [])),
-                audio_duration,
-            )
-            fallback_triggered = True
-            all_segments = self._transcribe_full_audio(audio_data)
-        else:
-            all_segments = []
-            for i, vad_group in enumerate(vad_segments, 1):
-                group_start = vad_group[0]["start_sec"]
-                group_end = vad_group[-1]["end_sec"]
-                logger.info(
-                    f"Transcribing group {i}/{len(vad_segments)} "
-                    f"({group_start:.1f}s - {group_end:.1f}s)"
-                )
-                segments = self._transcribe_vad_group(audio_data, sample_rate, vad_group)
-                all_segments.extend(segments)
+            logger.debug(f"No speech detected in {audio_path.name}")
+            return {"segments": [], "text": "", "language": self.whisper_params.get('language', 'ja')}
 
-        if fallback_triggered and not all_segments:
-            # Safety net: if fallback still produced nothing, log explicitly for debugging.
-            logger.warning(
-                "Full-clip fallback for %s emitted no segments. Returning empty result.",
-                audio_path.name,
+        all_segments = []
+        for i, vad_group in enumerate(vad_segments, 1):
+            group_start = vad_group[0]["start_sec"]
+            group_end = vad_group[-1]["end_sec"]
+            logger.info(
+                f"Transcribing group {i}/{len(vad_segments)} "
+                f"({group_start:.1f}s - {group_end:.1f}s)"
             )
+            segments = self._transcribe_vad_group(audio_data, sample_rate, vad_group)
+            all_segments.extend(segments)
 
+        return self._finalise(all_segments)
+
+    def _finalise(self, all_segments: List[Dict]) -> Dict:
+        """Validate and package the result. Shared by both transcription routes."""
         # Validate translation output - warn if translation was requested but output appears Japanese
         if self.task == 'translate' and all_segments:
             # Check if output contains significant Japanese characters
@@ -356,6 +382,15 @@ class WhisperProASR:
             "text": " ".join(seg["text"] for seg in all_segments),
             "language": self.whisper_params.get('language', 'ja')
         }
+
+    def get_segmenter_name(self) -> str:
+        """Name of the speech segmenter actually in use, or "none".
+
+        Mirrors ``FasterWhisperProASR.get_segmenter_name`` so the two recognisers
+        answer the same question the same way.
+        """
+        seg = getattr(self, "_external_segmenter", None)
+        return getattr(seg, "name", "none") if seg is not None else "none"
 
     def _run_speech_segmentation(self, audio_data: np.ndarray, sample_rate: int) -> List[List[Dict]]:
         """
@@ -520,12 +555,18 @@ class WhisperProASR:
     def transcribe_to_srt(self, 
                          audio_path: Union[str, Path], 
                          output_srt_path: Union[str, Path],
+                         vad_audio_path: Optional[Union[str, Path]] = None,
                          **kwargs) -> Path:
-        """Transcribes audio and saves the result as an SRT file."""
+        """Transcribes audio and saves the result as an SRT file.
+
+        ``vad_audio_path`` is the cleaned-up copy of the same audio to find the
+        speech in, when the user asked for "enhance for VAD only". The
+        recogniser still hears ``audio_path``.
+        """
         audio_path = Path(audio_path)
         output_srt_path = Path(output_srt_path)
         
-        result = self.transcribe(audio_path, **kwargs)
+        result = self.transcribe(audio_path, vad_audio_path=vad_audio_path, **kwargs)
         
         srt_subs = []
         for idx, segment in enumerate(result.get("segments", []), 1):

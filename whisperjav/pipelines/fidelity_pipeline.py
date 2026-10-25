@@ -10,6 +10,8 @@ from datetime import datetime
 
 from whisperjav.pipelines.base_pipeline import BasePipeline
 from whisperjav.modules.audio_extraction import AudioExtractor
+from whisperjav.modules.audio_integrity import AudioIntegrityStop, apply_to_run as apply_audio_integrity
+from whisperjav.modules import analytics
 from whisperjav.modules.whisper_pro_asr import WhisperProASR
 from whisperjav.modules.srt_postprocessing import SRTPostProcessor as StandardPostProcessor
 
@@ -17,6 +19,7 @@ from whisperjav.modules.scene_detection_backends import SceneDetectorFactory
 
 from whisperjav.modules.srt_stitching import SRTStitcher
 from whisperjav.utils.logger import logger
+from whisperjav.utils.model_refresh import DEFAULT_MODEL_REFRESH_AUDIO_MINUTES, ModelRefreshPolicy
 
 
 from whisperjav.utils.progress_display import DummyProgress
@@ -28,6 +31,7 @@ from whisperjav.modules.speech_enhancement import (
     enhance_scenes,
     get_extraction_sample_rate,
     is_passthrough_backend,
+    resample_scenes,
 )
 
 class FidelityPipeline(BasePipeline):
@@ -108,13 +112,25 @@ class FidelityPipeline(BasePipeline):
         self._enhancer_is_passthrough = is_passthrough_backend(self._enhancer_backend_name)
         self._enhance_for_vad = kwargs.get("enhance_for_vad", False)
         if self._enhance_for_vad and not self._enhancer_is_passthrough:
-            logger.info("Enhance-for-VAD requested — enhancement will be applied to both VAD and ASR in fidelity pipeline")
+            logger.info("Enhance-for-VAD: the cleaned-up audio will be used to find "
+                        "the speech, and the original for transcription")
 
         # v1.8.5+: Extract at 16kHz when enhancer is "none" (skip enhancement entirely)
         # Extract at 48kHz when a real enhancer is configured (enhancer needs high-SR)
         extraction_sr = get_extraction_sample_rate(self._enhancer_backend_name)
         self.audio_extractor = AudioExtractor(sample_rate=extraction_sr)
         self.scene_detector = SceneDetectorFactory.safe_create_from_legacy_kwargs(**scene_opts)
+
+        # v1.9.2 (owner CFF1 / D2): reload the Whisper model after this many
+        # minutes of SCENE audio, at a scene boundary. 0 = never. Sync path sets
+        # the attribute after construction; async uses resolved_config; ensemble
+        # passes it as a kwarg.
+        self.model_refresh_audio_minutes = float(
+            kwargs.get(
+                "model_refresh_audio_minutes",
+                resolved_config.get("model_refresh_audio_minutes", DEFAULT_MODEL_REFRESH_AUDIO_MINUTES),
+            ) or 0.0
+        )
 
         # ASR CONFIG (model created in process() after enhancement cleanup)
         self._asr_config = {
@@ -141,9 +157,54 @@ class FidelityPipeline(BasePipeline):
             self.lang_code = params["decoder"].get("language", "ja")
         self.standard_postprocessor = StandardPostProcessor(language=self.lang_code, **post_proc_opts)
 
+    def _release_asr(self, asr, carry: Dict[str, int]) -> None:
+        """v1.9.2 (CFF1), step 1 of a refresh: fold the instance's filter statistics
+        into ``carry`` and run its teardown (the external segmenter it owns, then
+        ``cleanup()``). The CALLER must drop its own reference (``asr = None``)
+        before ``_load_fresh_asr`` — a reference held anywhere keeps the model in
+        memory, so the new one would load beside it.
+        """
+        try:
+            for k, v in (asr.get_filter_statistics() or {}).items():
+                carry[k] = carry.get(k, 0) + int(v or 0)
+        except Exception:  # noqa: BLE001 - statistics are best-effort
+            pass
+        seg = getattr(asr, "_external_segmenter", None)
+        if seg is not None and hasattr(seg, "cleanup"):
+            try:
+                seg.cleanup()
+            except Exception as e:  # noqa: BLE001
+                logger.debug(f"Segmenter cleanup during refresh failed (non-fatal): {e}")
+        asr.cleanup()
+
+    def _load_fresh_asr(self, policy: ModelRefreshPolicy):
+        """v1.9.2 (CFF1), step 2 of a refresh: collect the released model, clear the
+        CUDA cache, load a fresh ``WhisperProASR`` (and its segmenter) and start
+        the next budget generation. A load failure raises and fails the file, as a
+        failed initial load would — there is no instance left to continue on.
+        """
+        import gc
+        gc.collect()
+        try:
+            import torch
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception:  # noqa: BLE001 - CUDA cache clear is best-effort
+            pass
+        new_asr = WhisperProASR(**self._asr_config)
+        if hasattr(new_asr, "reset_statistics"):
+            new_asr.reset_statistics()
+        policy.reset()
+        return new_asr
+
     def process(self, media_info: Dict) -> Dict:
         """Process media file through fidelity pipeline with scene detection and VAD-enhanced ASR."""
         start_time = time.time()
+        # Cross-cutting rule of the agreed error-handling table (2026-09-17):
+        # anything that quietly fell short is reported in the run summary rather
+        # than only in the log. Reset per file -- the pipeline object is reused
+        # across the whole run.
+        self.degradations = []
         
         input_file = media_info['path']
         media_basename = media_info['basename']
@@ -175,6 +236,10 @@ class FidelityPipeline(BasePipeline):
             
             audio_path = self.temp_dir / f"{media_basename}_extracted.wav"
             extracted_audio, duration = self.audio_extractor.extract(input_file, audio_path)
+            # 1.9.4 (REQ1): a damaged audio track makes this file 'suspect', or
+            # stops it here with --fail-on suspect.
+            apply_audio_integrity(self.audio_extractor.last_integrity, self.degradations,
+                                  in_summary=self.audio_integrity_in_summary)
             master_metadata["input_info"]["processed_audio_file"] = str(extracted_audio)
             master_metadata["input_info"]["audio_duration_seconds"] = duration
             self.metadata_manager.update_processing_stage(
@@ -201,6 +266,18 @@ class FidelityPipeline(BasePipeline):
                 }
                 master_metadata["scenes_detected"].append(scene_info)
             master_metadata["summary"]["total_scenes_detected"] = len(scene_paths)
+
+            # Tell the user which scenes look likely to lose speech, before they
+            # spend the run finding out. Reads and prints only; never raises.
+            _analytics = analytics.report(
+                extracted_audio,
+                [(i, s.start_sec, s.end_sec)
+                 for i, s in enumerate(detection_result.scenes)],
+                scene_method=self.scene_detector.name,
+                vad_threshold=self.vad_params.get("threshold", 0.40),
+            )
+            if _analytics is not None:
+                master_metadata["audio_analytics"] = _analytics.to_dict()
             self.metadata_manager.update_processing_stage(
                 master_metadata, "scene_detection", "completed",
                 scene_count=len(scene_paths), scenes_dir=str(scenes_dir))
@@ -215,6 +292,11 @@ class FidelityPipeline(BasePipeline):
             import gc
 
             self.progress.set_current_step("Preparing audio for ASR", 3, 6)
+
+            # Set only when the user asked for "enhance for VAD only" AND there is
+            # a real enhancer to do it: the cleaned-up scenes, used to find the
+            # speech while the recogniser hears the originals.
+            vad_scene_paths = None
 
             if self._enhancer_is_passthrough:
                 # v1.8.5+: Scenes already at 16kHz — skip enhancement entirely
@@ -251,13 +333,36 @@ class FidelityPipeline(BasePipeline):
                         print(f"\rEnhancing: [{scene_num}/{total}] {pct:.0f}%", end='', flush=True)
 
                 # B. Process Enhancement (includes 48kHz→16kHz resampling)
-                scene_paths = enhance_scenes(
+                enhanced_paths = enhance_scenes(
                     scene_paths,
                     enhancer,
                     self.temp_dir,
                     progress_callback=enhancement_progress,
+                    degradations=self.degradations,
                 )
                 print()  # Newline after progress
+
+                if self._enhance_for_vad:
+                    # Dual-track (owner, 2026-09-17): the cleaned-up audio finds
+                    # the speech, the original is what the recogniser hears. The
+                    # originals are resampled to the same rate so the boundaries
+                    # the detector reports land in the right place.
+                    vad_scene_paths = enhanced_paths
+                    scene_paths = resample_scenes(scene_paths, self.temp_dir)
+                    if len(vad_scene_paths) != len(scene_paths):
+                        # The two lists are paired by position below. They are
+                        # built one entry per scene, failures included, so this
+                        # cannot happen today -- but pairing the wrong scenes
+                        # would put every subtitle in the wrong place, so it is
+                        # checked rather than assumed.
+                        raise RuntimeError(
+                            f"Enhance-for-VAD: {len(vad_scene_paths)} cleaned-up "
+                            f"scenes but {len(scene_paths)} original scenes.")
+                    logger.info(
+                        "Enhance-for-VAD: speech is detected in the cleaned-up "
+                        "audio, and the recogniser hears the original")
+                else:
+                    scene_paths = enhanced_paths
 
                 # C. DESTROY Enhancer - This is the "JIT Unload"
                 # We must confirm VRAM is near-zero before loading ASR
@@ -272,6 +377,7 @@ class FidelityPipeline(BasePipeline):
             master_metadata["config"]["speech_enhancement"] = {
                 "enabled": not self._enhancer_is_passthrough,
                 "backend": enhancer_name,
+                "dual_track": vad_scene_paths is not None,
             }
 
             # =================================================================
@@ -384,6 +490,11 @@ class FidelityPipeline(BasePipeline):
                                 f"Scene {scene_num}/{total_scenes} failed: {item.get('error', '')}",
                                 "error", 2.0)
 
+                        # v1.9.2 (CFF1 / D2), adapted to the subprocess workers:
+                        # the model generation that decoded this scene is the
+                        # worker generation reported by the runner.
+                        master_metadata["scenes_detected"][idx]["model_epoch"] = item.get("worker_epoch", 1)
+
                         done += 1
                         self.progress.update_subtask(1)
 
@@ -488,6 +599,15 @@ class FidelityPipeline(BasePipeline):
             # the OS. Nothing to clean up in this process.
             logger.debug("ASR cleanup skipped (subprocess workers already exited)")
 
+            # v1.9.2 (CFF1), adapted to the subprocess workers: how often the
+            # recogniser was replaced during this file. The recogniser lives in
+            # the worker subprocess, so a "refresh" here is a worker recycle --
+            # the runner counts its own respawns (scene budget, RSS ceiling, or
+            # a worker crash).
+            master_metadata["summary"]["model_refresh_audio_minutes"] = self.model_refresh_audio_minutes
+            master_metadata["summary"]["model_refreshes"] = getattr(
+                runner, "worker_recycles", 0) if runner is not None else 0
+
             master_metadata["summary"]["final_subtitles_raw"] += logprob_filtered + nonverbal_filtered
             master_metadata["summary"]["quality_metrics"].update({
                 "logprob_filtered": logprob_filtered,
@@ -497,6 +617,10 @@ class FidelityPipeline(BasePipeline):
 
             total_time = time.time() - start_time
             master_metadata["summary"]["total_processing_time_seconds"] = round(total_time, 2)
+            # Carried out with the rest of the summary so every caller sees it
+            # the same way: the plain path, the async path, and a pass running in
+            # its own process (agreed error-handling table, 2026-09-17).
+            master_metadata["summary"]["degradations"] = list(getattr(self, "degradations", None) or [])
             master_metadata["metadata_master"]["updated_at"] = datetime.now().isoformat() + "Z"
             
             self.metadata_manager.save_master_metadata(master_metadata, media_basename)
@@ -517,7 +641,8 @@ class FidelityPipeline(BasePipeline):
             
         except Exception as e:
             self.progress.show_message(f"Pipeline error: {str(e)}", "error", 0)
-            logger.error(f"Pipeline error: {e}", exc_info=True)
+            # A stop asked for by --fail-on suspect is not a crash: no traceback.
+            logger.error(f"Pipeline error: {e}", exc_info=not isinstance(e, AudioIntegrityStop))
             self.metadata_manager.update_processing_stage(
                 master_metadata, "error", "failed", error_message=str(e))
             self.metadata_manager.save_master_metadata(master_metadata, media_basename)

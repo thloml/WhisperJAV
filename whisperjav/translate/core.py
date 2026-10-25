@@ -3,8 +3,87 @@ Core translation logic - PySubtrans wrapper.
 """
 
 import os
+import re
 import sys
 from pathlib import Path
+
+# PySubtrans extracts only the last occurrence of each context tag. Some local
+# models repeat these tags after every cue, leaving earlier copies in the SRT.
+_CONTEXT_TAG_PAIR = re.compile(
+    r"<(?P<tag>summary|scene|synopsis)>"
+    r"(?P<value>(?:(?!\n[ \t]*#\d+\b)[\s\S])*?)"
+    r"</(?P=tag)>",
+    re.IGNORECASE,
+)
+
+
+def strip_translation_context_tags(text: str) -> tuple[str, dict[str, str], int]:
+    """Remove complete context tags and retain the last value of each kind."""
+    context = {}
+    count = 0
+
+    def remove(match):
+        nonlocal count
+        count += 1
+        context[match.group("tag").lower()] = match.group("value").strip()
+        return ""
+
+    return _CONTEXT_TAG_PAIR.sub(remove, text), context, count
+
+
+def apply_translation_context_filter(translator) -> bool:
+    """Clean provider responses before PySubtrans parses them into subtitle lines."""
+    client = getattr(translator, "client", None)
+    if client is None or not hasattr(client, "RequestTranslation"):
+        return False
+
+    original = client.RequestTranslation
+
+    def filtered_request(*args, **kwargs):
+        translation = original(*args, **kwargs)
+        content = getattr(translation, "content", None)
+        if not isinstance(content, dict) or not isinstance(content.get("text"), str):
+            return translation
+
+        cleaned_text, context, count = strip_translation_context_tags(content["text"])
+        if not count:
+            return translation
+
+        # Rebuild through PySubtrans's own Translation class so its other
+        # metadata parsers still run. Restore the extracted context afterwards.
+        cleaned = translation.__class__({**content, "text": cleaned_text})
+        cleaned.content.update(context)
+        if count > len(context):
+            print(f"[TRANSLATE] Removed {count - len(context)} repeated context tags", file=sys.stderr)
+        return cleaned
+
+    client.RequestTranslation = filtered_request
+    return True
+
+
+def clean_resumed_translation_tags(project) -> int:
+    """Remove tags already saved in a .subtrans project before resume skips them."""
+    changed = 0
+    changed_originals = False
+    subtitles = getattr(project, "subtitles", None)
+    for scene in getattr(subtitles, "scenes", ()) or ():
+        for batch in getattr(scene, "batches", ()) or ():
+            for line in getattr(batch, "translated", ()) or ():
+                if line.text:
+                    cleaned, _, count = strip_translation_context_tags(line.text)
+                    if count:
+                        line.text = cleaned.strip()
+                        changed += 1
+            for line in getattr(batch, "originals", ()) or ():
+                if line.translation:
+                    cleaned, _, count = strip_translation_context_tags(line.translation)
+                    if count:
+                        line.translation = cleaned.strip()
+                        changed_originals = True
+
+    if changed or changed_originals:
+        project.needs_writing = True
+    return changed
 
 
 def cap_batch_size_for_context(max_batch_size: int, n_ctx: int) -> int:
@@ -55,6 +134,199 @@ def cap_batch_size_for_context(max_batch_size: int, n_ctx: int) -> int:
     tokens_per_line = 500  # input + output per subtitle line (worst-case long lines)
     safe_max = max(5, (n_ctx - overhead) // tokens_per_line)
     return min(max_batch_size, safe_max)
+
+
+# PySubtrans defaults min_batch_size to 10 (Options.py) and SubtitleBatcher
+# raises "min_batch_size must be less than max_batch_size" when the floor
+# exceeds the ceiling.
+PYSUBTRANS_DEFAULT_MIN_BATCH = 10
+
+
+def should_disable_deepseek_thinking(model: str) -> bool:
+    """Whether to ask DeepSeek to turn reasoning off for *model* (#395).
+
+    DeepSeek changed the server-side default so that v4 models reason before
+    answering. For subtitle translation that is pure cost: it is slow, it burns
+    rate limit, and the reasoning text can leak into the output and break the
+    line-for-line format.
+
+    Only ``-flash`` is switched off. ``-pro`` *is* the reasoning model, so a user
+    who selects it has asked for reasoning and we leave their choice alone. Models
+    outside the v4 family are untouched, except the current ``deepseek-flash``.
+    """
+    if not model:
+        return False
+    m = model.lower()
+    return m == 'deepseek-flash' or ('deepseek-v4' in m and 'pro' not in m)
+
+
+def apply_deepseek_thinking_patch(translator, model: str, debug: bool = False) -> bool:
+    """Ask DeepSeek not to reason, by adding ``thinking`` to the request body.
+
+    PySubtrans talks to DeepSeek's chat-completion endpoint directly rather than
+    through the OpenAI SDK, so this is a plain top-level field in the request
+    body — not the SDK's ``extra_body`` wrapper. ``CustomClient`` builds a fixed
+    body with no extension point, so the method is wrapped on the client
+    instance, mirroring the Qwen3 reasoning patch applied further down this file.
+
+    Credit: diagnosed and prototyped by @mcdman on #395.
+
+    Returns True if the patch was applied.
+    """
+    if not should_disable_deepseek_thinking(model):
+        return False
+
+    client = getattr(translator, 'client', None)
+    if client is None or not hasattr(client, '_generate_request_body'):
+        print("[TRANSLATE]   WARNING: could not disable DeepSeek thinking mode - "
+              "translator.client._generate_request_body not found",
+              file=sys.stderr)
+        return False
+
+    original = client._generate_request_body
+
+    def _patched(request, temperature, _orig=original):
+        body = _orig(request, temperature)
+        try:
+            body['thinking'] = {"type": "disabled"}
+        except TypeError:
+            return body
+        if debug:
+            print("[TRANSLATE]   [deepseek-patch] thinking disabled", file=sys.stderr)
+        return body
+
+    client._generate_request_body = _patched
+    print(f"[TRANSLATE]   DeepSeek thinking mode: DISABLED for {model}", file=sys.stderr)
+    return True
+
+
+def apply_server_temperature_patch(translator, debug: bool = False) -> bool:
+    """Leave the temperature to a custom server: drop it from the request body (#444).
+
+    WhisperJAV sent its tone's temperature (standard 0.5, contextual 0.8, pornify
+    1.2) with every request, and PySubtrans' CustomClient always sends one (0.0
+    when none is set), so a server's own temperature never applied. Owner,
+    2026-10-06: custom servers keep theirs. Used only for provider 'custom' when
+    the user gave no --temperature. Same instance-level wrap as the DeepSeek patch.
+
+    Returns True if the patch was applied.
+    """
+    client = getattr(translator, 'client', None)
+    if client is None or not hasattr(client, '_generate_request_body'):
+        print("[TRANSLATE]   WARNING: could not leave the temperature to the custom server - "
+              "translator.client._generate_request_body not found", file=sys.stderr)
+        return False
+
+    original = client._generate_request_body
+
+    def _patched(request, temperature, _orig=original):
+        body = _orig(request, temperature)
+        try:
+            body.pop('temperature', None)
+        except AttributeError:
+            return body
+        if debug:
+            print("[TRANSLATE]   [server-temperature] temperature left out of the request", file=sys.stderr)
+        return body
+
+    client._generate_request_body = _patched
+    print("[TRANSLATE]   Temperature: set by the custom server (not sent)", file=sys.stderr)
+    return True
+
+
+def target_language_name(target_lang: str) -> str:
+    """'chinese' -> 'Chinese'; the name the instructions and the prompt use."""
+    name = (target_lang or "").strip()
+    return name[:1].upper() + name[1:] if name else "the target language"
+
+
+def write_shared_text(path, text: str) -> str:
+    """Write a temp file that other runs may be reading, and return the path to use.
+
+    Two translations of the same tone at the same moment share these files (review
+    finding, 2026-10-06). Rewriting one while another run reads it could hand that
+    run an empty file; on Windows a file another run has open cannot be replaced at
+    all. So: a file that already holds this text is left alone (the usual case:
+    same tone, same bundled text); otherwise the text goes to a private temp file
+    that is swapped in, and if the swap is refused the private file is used instead.
+    """
+    import tempfile
+    path = Path(path)
+    try:
+        if path.read_text(encoding="utf-8") == text:
+            return str(path)
+    except OSError:
+        pass
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=path.stem + "_", suffix=path.suffix, dir=str(path.parent))
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write(text)
+    try:
+        os.replace(tmp, path)
+        return str(path)
+    except OSError:
+        return tmp          # the shared file is in use; this run reads its own copy
+
+
+def fill_target_language(instruction_file, target_lang: str) -> str:
+    """Write the target language into an instruction file that asks for it ({LANG}).
+
+    WP-001 / #347 (owner, 2026-10-06): the instructions never named the target
+    language and their example answered in English, so local models drifted into
+    English. Tags inside the instructions are not filled in on this path, so
+    WhisperJAV fills {LANG} itself and passes a filled copy. A file without {LANG}
+    (a user's own) is passed unchanged.
+    """
+    import tempfile
+    path = Path(instruction_file)
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return str(instruction_file)
+    if "{LANG}" not in text:
+        return str(instruction_file)
+    name = target_language_name(target_lang)
+    out_dir = Path(tempfile.gettempdir()) / "whisperjav_translate"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    import hashlib
+    digest = hashlib.sha1(text.encode("utf-8")).hexdigest()[:8]   # different texts never share a copy
+    out = out_dir / f"{path.stem}_{name.lower().replace(' ', '_')}_{digest}.txt"
+    # The rule sentence is written as its meaning, not filled literally
+    # ("unless Chinese is English" reads oddly): kept for other targets, dropped for English.
+    rule = "Do not answer in English unless {LANG} is English."
+    text = text.replace(" " + rule, "" if name.lower() == "english" else " Do not answer in English.")
+    return write_shared_text(out, text.replace("{LANG}", name))
+
+
+def resolve_batch_window(max_batch_size: int) -> tuple:
+    """Return a (min_batch_size, max_batch_size) pair PySubtrans will accept.
+
+    ``cap_batch_size_for_context`` lowers the ceiling to fit the model's context
+    window, but nothing lowered the floor, which PySubtrans defaults to 10.  For
+    any context of 4096 or less the ceiling comes out at 5, so the floor exceeded
+    it and every translation aborted with::
+
+        Error translating xxx.srt: min_batch_size must be less than max_batch_size
+
+    That made small-context Ollama models (qwen2.5:3b and friends) unusable for
+    translation, deterministically, with an error that pointed at a setting the
+    user had not touched — the reported Max Batch Size of 30 was already being
+    overridden by the cap (#341).
+
+    Args:
+        max_batch_size: the ceiling, typically from cap_batch_size_for_context().
+
+    Returns:
+        ``(min_batch_size, max_batch_size)`` with the floor guaranteed not to
+        exceed the ceiling.  The default floor is preserved whenever it fits, so
+        behaviour for ordinary context sizes is unchanged.
+    """
+    max_batch_size = max(1, int(max_batch_size))
+    min_batch_size = min(PYSUBTRANS_DEFAULT_MIN_BATCH, max_batch_size)
+    if min_batch_size == max_batch_size and max_batch_size > 1:
+        # Keep a genuine window rather than a single admissible size.
+        min_batch_size = max_batch_size - 1
+    return max(1, min_batch_size), max_batch_size
 
 
 def compute_max_output_tokens(batch_size: int, n_ctx: int) -> int:
@@ -136,6 +408,66 @@ def _api_base_to_custom_server(api_base: str) -> tuple:
     return server_address, endpoint
 
 
+def server_log_hint(provider_config: dict, verbose: bool = False):
+    """
+    Where this run's server keeps its own log, as lines to print.
+
+    Which server that is depends on the provider the user chose: "local" is the
+    llama-cpp-python server WhisperJAV starts on this machine and whose log path
+    it prints; "ollama" is Ollama; a server the user gave an address for is
+    theirs; anything else is a service on the internet with no local log at all.
+
+    Read 'whisperjav_provider', never 'pysubtrans_name': the latter is the name
+    of PySubtrans's client class, and local, ollama, glm, groq and custom are
+    all 'Custom Server' there.
+    """
+    name = str(provider_config.get('whisperjav_provider', '')).lower()
+
+    if name == 'local':
+        try:
+            from whisperjav.translate import local_backend
+            # Without this the log is deleted when the server stops, which is
+            # before the user can go and read it.
+            local_backend.keep_server_log()
+            path = getattr(local_backend, '_server_stderr_path', None)
+        except Exception:
+            path = None
+        if path:
+            return [f"The local translation server's own log: {path}"]
+        return ["The local translation server writes its own log; its path is "
+                "printed as [LOCAL-LLM] Server log: when the server starts."]
+
+    if name == 'ollama':
+        if verbose:
+            return ["For Ollama's own server-side logs (model loading, GGUF errors):",
+                    "  Windows: check the Ollama app log or run 'ollama logs'",
+                    "  Linux/macOS: journalctl -u ollama or OLLAMA_DEBUG=1 ollama serve"]
+        return ["Check Ollama's server logs for details: ollama logs"]
+
+    # A cloud provider pointed at a --translate-endpoint on this machine is no
+    # longer a cloud service, so ask the address, not the name.
+    address = str(provider_config.get('server_address')
+                  or provider_config.get('api_base') or '')
+    if name == 'custom' or _address_is_on_this_machine(address):
+        return ["The server at the address you gave is the one that failed; "
+                "its logs are wherever you are running it."]
+
+    return ["This is a cloud service, so there is no local log: the error "
+            "above is what it returned."]
+
+
+def _address_is_on_this_machine(address: str) -> bool:
+    """True when a server address points at this computer rather than the internet."""
+    if not address:
+        return False
+    try:
+        from urllib.parse import urlparse
+        host = (urlparse(address).hostname or '').lower()
+    except Exception:
+        return False
+    return host in ('localhost', '127.0.0.1', '::1', '0.0.0.0')
+
+
 def translate_subtitle(
     input_path: str,
     output_path: Path,
@@ -189,11 +521,13 @@ def translate_subtitle(
             print(f"[TRANSLATE]   API base: {provider_config['api_base']}", file=sys.stderr)
 
         # Build prompt
+        prompt = (f"Translate these subtitles from {target_language_name(source_lang)} "
+                  f"into {target_language_name(target_lang)}.")
         # The output-language sentence is repeated here (not only in the
         # instruction file) because small/local models follow the user
         # message more reliably than system instructions.
-        prompt = f"Translate these subtitles from {source_lang} into {target_lang}."
-        prompt += f" CRITICAL: Write every Translation line in {target_lang} only. Never use English unless {target_lang} is english."
+        prompt += (f" CRITICAL: Write every Translation line in {target_language_name(target_lang)} only."
+                   f" Never use English unless {target_language_name(target_lang)} is English.")
         if extra_context:
             prompt += "\n" + extra_context
             print(f"[TRANSLATE]   Extra context: {extra_context[:200]}", file=sys.stderr)
@@ -201,10 +535,30 @@ def translate_subtitle(
         # Qwen3-family thinking model flag: consumed later by the response
         # parsing patch (after provider init). Remove from provider_options
         # so it doesn't get passed to PySubtrans as an unknown option.
+        # Work on a copy: the translate CLI passes ONE provider_options dict for every
+        # file of a run, and the pops below would strip the flags from file 2 onward
+        # (found by review, 2026-10-06; it affected _thinking_model too).
+        provider_options = dict(provider_options) if provider_options else provider_options
         _is_thinking_model = provider_options.pop('_thinking_model', False) if provider_options else False
+        # #444: provider 'custom' with no --temperature leaves the temperature to the server.
+        _server_temperature = provider_options.pop('_server_temperature', False) if provider_options else False
+        if _server_temperature:
+            provider_options.pop('temperature', None)
         if _is_thinking_model:
             print(f"[TRANSLATE]   Thinking model: YES (will patch response parsing)",
                   file=sys.stderr)
+
+        # Resolve a batch window PySubtrans will accept.  The caller supplies
+        # only a ceiling; if it has been capped below PySubtrans' default floor
+        # of 10, passing that floor through raises before any translation runs
+        # (#341).
+        _resolved_min_batch, _resolved_max_batch = resolve_batch_window(max_batch_size)
+        if _resolved_max_batch != max_batch_size or _resolved_min_batch != PYSUBTRANS_DEFAULT_MIN_BATCH:
+            print(
+                f"[TRANSLATE]   Batch window: min={_resolved_min_batch}, "
+                f"max={_resolved_max_batch}",
+                file=sys.stderr,
+            )
 
         # Build provider options
         opt_kwargs = {
@@ -215,7 +569,8 @@ def translate_subtitle(
             'prompt': prompt,
             'preprocess_subtitles': True,
             'scene_threshold': scene_threshold,
-            'max_batch_size': max_batch_size,
+            'max_batch_size': _resolved_max_batch,
+            'min_batch_size': _resolved_min_batch,
             'postprocess_translation': True
         }
 
@@ -225,6 +580,7 @@ def translate_subtitle(
         # does not exist in current PySubtrans — instructions were silently
         # dropped for ALL providers.
         if instruction_file:
+            instruction_file = fill_target_language(instruction_file, target_lang)  # WP-001
             opt_kwargs['instruction_file'] = str(instruction_file)
 
         if 'api_base' in provider_config:
@@ -389,6 +745,14 @@ def translate_subtitle(
         print(f"[TRANSLATE] Loading subtitle project...", file=sys.stderr)
         project = init_project(options, filepath=str(input_path), persistent=True)
 
+        if provider_config.get('whisperjav_provider') == 'ollama':
+            cleaned_resumed = clean_resumed_translation_tags(project)
+            if cleaned_resumed:
+                print(
+                    f"[TRANSLATE] Cleaned context tags from {cleaned_resumed} saved subtitle lines",
+                    file=sys.stderr,
+                )
+
         # Set output path immediately so ALL intermediate saves (SaveProject
         # after each batch) go to the user's desired location.  Without this,
         # PySubtrans defaults to writing in the input directory — either as
@@ -434,6 +798,18 @@ def translate_subtitle(
         translator = init_translator(options, translation_provider=provider)
 
         # =====================================================================
+        # DeepSeek: turn reasoning off for flash (deepseek-flash, deepseek-v4-flash) (#395)
+        # =====================================================================
+        # DeepSeek made v4 models reason by default server-side, which is slow,
+        # rate-limit hungry, and can leak reasoning text into the subtitles.
+        if provider_config.get('pysubtrans_name') == 'DeepSeek':
+            apply_deepseek_thinking_patch(translator, model, debug=debug)
+
+        # Custom server keeps its own temperature (#444)
+        if _server_temperature:
+            apply_server_temperature_patch(translator, debug=debug)
+
+        # =====================================================================
         # Qwen3 thinking model workaround: patch response parsing
         # =====================================================================
         # Ollama returns thinking output in 'reasoning' field with empty
@@ -471,6 +847,10 @@ def translate_subtitle(
         # Enable resume mode to skip already-translated batches when resuming
         # This is critical for interrupted translations - without it, the translator
         # will re-translate everything from the beginning even if a .subtrans file exists
+        if provider_config.get('whisperjav_provider') == 'ollama':
+            if not apply_translation_context_filter(translator):
+                print("[TRANSLATE]   WARNING: Could not install context tag filter", file=sys.stderr)
+
         translator.resume = True
         print(f"[TRANSLATE]   Resume mode: enabled (will skip already-translated batches)", file=sys.stderr)
 
@@ -535,6 +915,9 @@ def translate_subtitle(
                 print(f"[TRANSLATE]   Consider: smaller --max-batch-size, different model, or cloud provider",
                       file=sys.stderr)
 
+        def _server_log_hint(verbose: bool = False):
+            return server_log_hint(provider_config, verbose=verbose)
+
         def _diagnostic_error_handler(sender, message=None, **kwargs):
             """Track all translation errors — not just HTTP errors."""
             _batch_stats['errors'] += 1
@@ -566,20 +949,21 @@ def translate_subtitle(
                         print(f"[TRANSLATE]   Request timed out — the model may be too slow. Try a smaller model or smaller batch size.",
                               file=sys.stderr)
                     else:
-                        print(f"[TRANSLATE]   Check Ollama server logs for details: ollama logs",
-                              file=sys.stderr)
-                    # Ollama's internal debug logs (GGUF parsing, tensor loading,
-                    # VRAM allocation) are only available server-side — they don't
-                    # flow through the HTTP API. Guide the user when debug is on.
+                        # Owner, 2026-09-17: this used to tell every provider to
+                        # "check Ollama server logs", including the local one,
+                        # which is llama-cpp-python and has nothing to do with
+                        # Ollama. The advice now matches the server in use.
+                        _where = _server_log_hint()
+                        for _line in _where:
+                            print(f"[TRANSLATE]   {_line}", file=sys.stderr)
+                    # A server's own logs (model loading, GGUF parsing, VRAM
+                    # allocation) never travel over the HTTP API, so the client
+                    # cannot show them. Point at them when debug is on.
                     if debug and _err_num == 1:
                         print(f"[TRANSLATE]   NOTE: WhisperJAV debug shows client-side HTTP traffic only.",
                               file=sys.stderr)
-                        print(f"[TRANSLATE]   For Ollama's own server-side logs (model loading, GGUF errors):",
-                              file=sys.stderr)
-                        print(f"[TRANSLATE]     Windows: check the Ollama app log or run 'ollama logs'",
-                              file=sys.stderr)
-                        print(f"[TRANSLATE]     Linux/macOS: journalctl -u ollama or OLLAMA_DEBUG=1 ollama serve",
-                              file=sys.stderr)
+                        for _line in _server_log_hint(verbose=True):
+                            print(f"[TRANSLATE]     {_line}", file=sys.stderr)
                 elif 'No text returned' in msg_str or 'no text' in msg_str.lower():
                     print(f"\n[TRANSLATE] *** EMPTY RESPONSE (attempt #{_err_num}) ***",
                           file=sys.stderr)

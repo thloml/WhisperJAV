@@ -46,7 +46,7 @@ Dedicated pipeline using models trained on anime and JAV dialogue.
 4. Click **Start**
 
 !!! tip
-    For maximum quality, use anime-whisper in Pass 1 and Qwen3-ASR in Pass 2 with Smart Merge.
+    For maximum quality, tick Pass 2: since 1.9.5 the Ensemble tab starts with Qwen3-ASR (FireRedVAD) in Pass 1 and Anime-Whisper (TEN VAD) in Pass 2, both on Aggressive.
 
 ---
 
@@ -99,7 +99,7 @@ Files are processed sequentially. Each output SRT is saved next to its source vi
 
 ## CPU-Only Mode (No GPU)
 
-WhisperJAV works without a GPU, just slower.
+WhisperJAV works without a GPU, just slower. When no usable GPU is found, the start-up check stops and asks whether to continue on the CPU; the GUI cannot ask, so the box below is required (on the command line, `--accept-cpu-mode` or `--device cpu`).
 
 1. Go to the **Advanced** tab
 2. Check **"Accept CPU-only mode"**

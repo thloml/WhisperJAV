@@ -37,6 +37,9 @@ from typing import Any, Dict, List, Optional, Tuple
 import stable_whisper
 
 from whisperjav.modules.audio_extraction import AudioExtractor
+from whisperjav.config.anime_whisper_vad import anime_leading_silence_default
+from whisperjav.modules.audio_integrity import apply_to_run as apply_audio_integrity
+from whisperjav.modules.analytics import report as report_audio_analytics
 from whisperjav.modules.speech_enhancement import (
     create_enhancer_direct,
     enhance_scenes,
@@ -98,6 +101,7 @@ class QwenPipeline(BasePipeline):
         qwen_safe_chunking: bool = True,  # Enforce 12-48s scene boundaries for ForcedAligner
         scene_min_duration: Optional[float] = None,  # Override min scene duration (default: 12s)
         scene_max_duration: Optional[float] = None,  # Override max scene duration (default: 48s)
+        scene_clustering_threshold: Optional[float] = None,  # v1.9.2: semantic clustering distance (None = the engine default, 22 since O1)
 
         # Temporal framing for assembly mode (GAP-5)
         qwen_framer: str = "vad-grouped",  # "vad-grouped", "full-scene", "srt-source"
@@ -159,6 +163,7 @@ class QwenPipeline(BasePipeline):
         # sensitive VAD/decoding captures. Whole-line exact match — safe. CLI:
         # --qwen-drop-nonverbal-lines / --no-qwen-drop-nonverbal-lines.
         drop_nonverbal_lines: bool = True,
+        anime_leading_silence_ms: Optional[int] = None,  # None: 200 ms, 0 with Silero
 
         # v1.9.0: Phase-8 scene-overlap timestamp resolver. Semantic scene
         # detection extracts scenes with a ±0.35s buffer (~0.7s overlap between
@@ -232,6 +237,7 @@ class QwenPipeline(BasePipeline):
         self.safe_chunking = qwen_safe_chunking
         self.scene_min_override = scene_min_duration  # None = use default (12s)
         self.scene_max_override = scene_max_duration  # None = use default (48s)
+        self.scene_clustering_threshold = scene_clustering_threshold  # None = the engine default (22 since O1)
 
         # Temporal framing for assembly mode (GAP-5)
         self.framer_backend = qwen_framer
@@ -292,6 +298,11 @@ class QwenPipeline(BasePipeline):
 
         # v1.9.0: Phase-8 nonverbal single-token line filter toggle.
         self.drop_nonverbal_lines = drop_nonverbal_lines
+        # v1.9.4: silence before every anime-whisper window (0 = off); see config/anime_whisper_vad.py.
+        # Not set by the user: 200 ms, or 0 with Silero (owner, 2026-10-09).
+        if anime_leading_silence_ms is None:
+            anime_leading_silence_ms = anime_leading_silence_default(speech_segmenter)
+        self.anime_leading_silence_ms = max(0, int(anime_leading_silence_ms or 0))
 
         # v1.9.0: Phase-8 scene-overlap timestamp resolver toggle.
         self.resolve_scene_overlaps = resolve_scene_overlaps
@@ -492,6 +503,12 @@ class QwenPipeline(BasePipeline):
                 dtype=cfg["dtype"],
                 no_repeat_ngram_size=cfg.get("no_repeat_ngram_size", 0),
                 max_new_tokens=aw_max_tokens,
+                # v1.9.4 (owner, 2026-10-06): silence before every window, 200 ms by
+                # default (anime-whisper only; it lowered the character error rate on
+                # the reference clips, Qwen3-ASR got worse); 0 with Silero (owner,
+                # 2026-10-09). Window edges and so the subtitle start/end do not move.
+                # 0 turns it off (CLI, ensemble, GUI).
+                leading_silence_ms=self.anime_leading_silence_ms,
             )
         elif self.generator_backend == "cohere":
             # Cohere Transcribe-03-2026 — gated HF repo, AutoModel + trust_remote_code.
@@ -591,6 +608,11 @@ class QwenPipeline(BasePipeline):
         Returns:
             Master metadata dictionary with paths, stats, quality metrics.
         """
+        # Cross-cutting rule of the agreed error-handling table (2026-09-17):
+        # anything that quietly fell short is reported in the run summary rather
+        # than only in the log. Reset per file -- the pipeline object is reused
+        # across the whole run.
+        self.degradations = []
         input_file = Path(media_info["path"])
         media_basename = media_info["basename"]
         pipeline_start = time.time()
@@ -622,6 +644,10 @@ class QwenPipeline(BasePipeline):
 
         audio_path = self.temp_dir / f"{media_basename}_extracted.wav"
         extracted_audio, duration = self.audio_extractor.extract(input_file, audio_path)
+        # 1.9.4 (REQ1): a damaged audio track makes this file 'suspect', or
+        # stops it here with --fail-on suspect.
+        apply_audio_integrity(self.audio_extractor.last_integrity, self.degradations,
+                              in_summary=self.audio_integrity_in_summary)
 
         master_metadata["duration_seconds"] = duration
         master_metadata["stages"]["extraction"] = {
@@ -667,9 +693,27 @@ class QwenPipeline(BasePipeline):
                 os.getpid(), min_dur, max_dur,
             )
 
+        # v1.9.2 (CFF2): semantic clustering threshold, independent of safe chunking.
+        if self.scene_clustering_threshold is not None:
+            scene_detector_kwargs["clustering_threshold"] = float(self.scene_clustering_threshold)
+
         scene_detector = SceneDetectorFactory.safe_create_from_legacy_kwargs(**scene_detector_kwargs)
         result = scene_detector.detect_scenes(extracted_audio, scenes_dir, media_basename)
         scene_paths = result.to_legacy_tuples()
+
+        # Tell the user which scenes look acoustically difficult. vad_threshold is
+        # None because this pipeline segments with WhisperSeg by default, not with
+        # Silero at a threshold -- so the quiet check, and the setting it would
+        # recommend, do not apply here. Reads and prints only; never raises.
+        _analytics = report_audio_analytics(
+            extracted_audio,
+            [(i, s.start_sec, s.end_sec) for i, s in enumerate(result.scenes)],
+            scene_method=result.method,
+            vad_threshold=None,
+        )
+        if _analytics is not None:
+            master_metadata.setdefault("audio_analytics", _analytics.to_dict())
+
         scene_detector.cleanup()
         logger.info(
             "[QwenPipeline PID %s] Phase 2: Detected %d scenes (method=%s)",
@@ -748,6 +792,7 @@ class QwenPipeline(BasePipeline):
             enhanced_paths = enhance_scenes(
                 scene_paths, enhancer, self.temp_dir,
                 progress_callback=_enhancement_progress,
+                degradations=self.degradations,
             )
             original_16k_paths = resample_scenes(scene_paths, self.temp_dir)
 
@@ -774,6 +819,7 @@ class QwenPipeline(BasePipeline):
             scene_paths = enhance_scenes(
                 scene_paths, enhancer, self.temp_dir,
                 progress_callback=_enhancement_progress,
+                degradations=self.degradations,
             )
 
             # VRAM Block 1 cleanup — release enhancer before loading ASR
@@ -903,6 +949,10 @@ class QwenPipeline(BasePipeline):
             scene_speech_regions=orch_speech_regions,
             vad_audio_paths=orch_vad_paths,
         )
+
+        # A failed aligner load no longer ends the job (#436); say so in the summary.
+        if getattr(self._subtitle_pipeline, "alignment_unavailable", None):
+            self.degradations.append(self._subtitle_pipeline.alignment_unavailable)
 
         # Convert to Phase 6 format: (WhisperResult, scene_idx)
         for idx, (result, _diag) in enumerate(orch_results):
@@ -1232,6 +1282,10 @@ class QwenPipeline(BasePipeline):
         total_time = time.time() - pipeline_start
         master_metadata["total_time_sec"] = total_time
         master_metadata["summary"]["total_processing_time_seconds"] = round(total_time, 2)
+        # Carried out with the rest of the summary so every caller sees it
+        # the same way: the plain path, the async path, and a pass running in
+        # its own process (agreed error-handling table, 2026-09-17).
+        master_metadata["summary"]["degradations"] = list(getattr(self, "degradations", None) or [])
 
         logger.info(
             "[QwenPipeline PID %s] Complete: %s (%d subtitles in %s)",

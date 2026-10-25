@@ -10,6 +10,8 @@ from datetime import datetime
 
 from whisperjav.pipelines.base_pipeline import BasePipeline
 from whisperjav.modules.audio_extraction import AudioExtractor
+from whisperjav.modules.audio_integrity import AudioIntegrityStop, apply_to_run as apply_audio_integrity
+from whisperjav.modules import analytics
 from whisperjav.modules.faster_whisper_pro_asr import FasterWhisperProASR
 from whisperjav.modules.srt_postprocessing import SRTPostProcessor as StandardPostProcessor
 
@@ -17,6 +19,8 @@ from whisperjav.modules.scene_detection_backends import SceneDetectorFactory
 
 from whisperjav.modules.srt_stitching import SRTStitcher
 from whisperjav.utils.logger import logger
+from whisperjav.utils.asr_telemetry import AsrTelemetry, resolve_telemetry_path
+from whisperjav.utils.model_refresh import DEFAULT_MODEL_REFRESH_AUDIO_MINUTES
 
 from whisperjav.utils.progress_display import DummyProgress
 from whisperjav.utils.progress_aggregator import AsyncProgressReporter
@@ -117,6 +121,14 @@ class BalancedPipeline(BasePipeline):
         self.tracer = kwargs.get('parameter_tracer', NullTracer())
 
         # --- V3 STRUCTURED CONFIG UNPACKING ---
+        # #394 per-scene ASR telemetry. On by default; the file goes to
+        # raw_subs/ next to the outputs unless a path is given. The sync path
+        # and the ensemble pass worker overwrite these attributes after
+        # construction; the async path only has resolved_config to carry them.
+        self.asr_telemetry_enabled = bool(resolved_config.get("asr_telemetry_enabled", True))
+        self.asr_telemetry_path = resolved_config.get("asr_telemetry")
+        self.asr_telemetry_tag = None  # e.g. "pass1" inside an ensemble run
+
         model_cfg = resolved_config["model"]
         params = resolved_config["params"]
         features = resolved_config["features"]
@@ -165,16 +177,34 @@ class BalancedPipeline(BasePipeline):
         self._enhancer_is_passthrough = is_passthrough_backend(self._enhancer_backend_name)
         self._enhance_for_vad = kwargs.get("enhance_for_vad", False)
         if self._enhance_for_vad and not self._enhancer_is_passthrough:
-            # Dual-track is fully supported in qwen/anime-whisper pipelines.
-            # For balanced/fidelity, enhancement is applied to both VAD and ASR
-            # (the VAD-only separation requires ASR module changes — planned for v1.9).
-            logger.info("Enhance-for-VAD requested — enhancement will be applied to both VAD and ASR in balanced pipeline")
+            # v1.9.3: this should no longer be reachable. Balanced finds the speech
+            # inside faster-whisper's own transcribe() call, on the same audio it
+            # transcribes, so there is no second track to hand the cleaned-up audio
+            # to; the owner's decision of 2026-09-17 is that balanced does not offer
+            # the setting at all. main.validate_balanced_vad_options refuses the flag
+            # for a balanced pass and the GUI hides the box. Kept as a guard, and
+            # honest about what it does if some other caller still sets it.
+            logger.warning(
+                "Enhance-for-VAD was set for a balanced pass, which cannot split the "
+                "two: the cleaned-up audio is used for speech detection AND for "
+                "transcription. Use the fidelity or qwen pipeline for the split.")
 
         # v1.8.5+: Extract at 16kHz when enhancer is "none" (skip enhancement entirely)
         # Extract at 48kHz when a real enhancer is configured (enhancer needs high-SR)
         extraction_sr = get_extraction_sample_rate(self._enhancer_backend_name)
         self.audio_extractor = AudioExtractor(sample_rate=extraction_sr)
         self.scene_detector = SceneDetectorFactory.safe_create_from_legacy_kwargs(**scene_opts)
+
+        # v1.9.2 (owner CFF1 / D2): unload and reload the recogniser after this
+        # many minutes of SCENE audio, at a scene boundary. 0 = never. The sync
+        # path overwrites the attribute after construction (like telemetry);
+        # async carries it in resolved_config; ensemble passes it as a kwarg.
+        self.model_refresh_audio_minutes = float(
+            kwargs.get(
+                "model_refresh_audio_minutes",
+                resolved_config.get("model_refresh_audio_minutes", DEFAULT_MODEL_REFRESH_AUDIO_MINUTES),
+            ) or 0.0
+        )
 
         # ASR CONFIG (model created lazily on first process() call)
         self._asr_config = {
@@ -221,6 +251,25 @@ class BalancedPipeline(BasePipeline):
         global _IMMORTAL_ASR_REFERENCE
 
         if self._asr is None:
+            if self.model_refresh_audio_minutes > 0:
+                # v1.9.2 (CFF1 / D5): the CTranslate2 model lives in a child
+                # process so it can be replaced with a fresh one when the refresh
+                # budget is spent — the only destructor-free way to "unload and
+                # reload" it (see asr_worker_proxy.py). Same seven-member surface
+                # as FasterWhisperProASR; the immortal reference is not needed.
+                from whisperjav.modules.asr_worker_proxy import RemoteFasterWhisperASR
+                from whisperjav.utils.model_refresh import ModelRefreshPolicy
+                logger.info(
+                    "Initializing ASR model in a worker process "
+                    "(fresh instance after every %.0f min of scene audio)",
+                    self.model_refresh_audio_minutes,
+                )
+                self._asr = RemoteFasterWhisperASR(
+                    self._asr_config,
+                    ModelRefreshPolicy.from_minutes(self.model_refresh_audio_minutes),
+                )
+                return self._asr
+
             logger.info("Initializing ASR model (exclusive VRAM block)")
             self._asr = FasterWhisperProASR(**self._asr_config)
 
@@ -232,9 +281,29 @@ class BalancedPipeline(BasePipeline):
 
         return self._asr
 
+    def cleanup(self):
+        """End the ASR worker (refresh mode) before the base cleanup.
+
+        The in-process immortal instance is deliberately NOT destroyed here
+        (see the module header); the worker process simply exits.
+        """
+        asr = self._asr
+        if asr is not None and hasattr(asr, "shutdown"):
+            try:
+                asr.shutdown()
+            except Exception as e:  # noqa: BLE001 - cleanup is best-effort
+                logger.warning(f"ASR worker shutdown failed (non-fatal): {e}")
+            self._asr = None
+        super().cleanup()
+
     def process(self, media_info: Dict) -> Dict:
         """Process media file through balanced pipeline with scene detection and VAD-enhanced ASR."""
         start_time = time.time()
+        # Cross-cutting rule of the agreed error-handling table (2026-09-17):
+        # anything that quietly fell short is reported in the run summary rather
+        # than only in the log. Reset per file -- the pipeline object is reused
+        # across the whole run.
+        self.degradations = []
 
         input_file = media_info['path']
         media_basename = media_info['basename']
@@ -275,6 +344,10 @@ class BalancedPipeline(BasePipeline):
 
             audio_path = self.temp_dir / f"{media_basename}_extracted.wav"
             extracted_audio, duration = self.audio_extractor.extract(input_file, audio_path)
+            # 1.9.4 (REQ1): a damaged audio track makes this file 'suspect', or
+            # stops it here with --fail-on suspect.
+            apply_audio_integrity(self.audio_extractor.last_integrity, self.degradations,
+                                  in_summary=self.audio_integrity_in_summary)
             master_metadata["input_info"]["processed_audio_file"] = str(extracted_audio)
             master_metadata["input_info"]["audio_duration_seconds"] = duration
             self.metadata_manager.update_processing_stage(
@@ -321,6 +394,18 @@ class BalancedPipeline(BasePipeline):
                     "longest": max((d for _, _, _, d in scene_paths), default=0),
                 }
             )
+
+            # Tell the user which scenes look likely to lose speech, before they
+            # spend the run finding out. Reads and prints only; never raises.
+            _analytics = analytics.report(
+                extracted_audio,
+                [(i, s.start_sec, s.end_sec)
+                 for i, s in enumerate(detection_result.scenes)],
+                scene_method=self.scene_detector.name,
+                vad_threshold=self.vad_params.get("threshold", 0.40),
+            )
+            if _analytics is not None:
+                master_metadata["audio_analytics"] = _analytics.to_dict()
 
             # =================================================================
             # PHASE 1: SPEECH ENHANCEMENT (Exclusive VRAM Block)
@@ -373,6 +458,7 @@ class BalancedPipeline(BasePipeline):
                     enhancer,
                     self.temp_dir,
                     progress_callback=enhancement_progress,
+                    degradations=self.degradations,
                 )
                 print()  # Newline after progress
 
@@ -407,6 +493,9 @@ class BalancedPipeline(BasePipeline):
             # BATCH_SCENES * leak_rate.
             # =================================================================
 
+            # (Subprocess architecture: there is no in-process ASR instance to
+            # reset here -- per-file statistics live in the worker processes
+            # and arrive with each batch result.)
             # Trace ASR config before transcription
             self.tracer.emit_asr_config(
                 model=self._asr_config["model_config"].get("model_name", "large-v2"),
@@ -445,6 +534,39 @@ class BalancedPipeline(BasePipeline):
 
             import json as _json
             from whisperjav.modules.scene_batch_runner import SceneBatchRunner
+
+            # v1.9.2 (owner Part C): name the mechanism actually in use, so the
+            # terminal states what ran instead of leaving the user to infer it.
+            # Under the subprocess architecture the segmenter name is reported
+            # by the worker with the first batch result; until then it is None.
+            _vad_method_name: str | None = None
+            _seg_label = "speech segmenter (pending first batch)"
+
+            # v1.9.2 (owner V1/V3): the consecutive-empty-scene tracker is gone.
+            # Its signal was "the detector reported speech and nothing came back",
+            # which is produced identically by two opposite situations it cannot
+            # separate -- a recogniser that has stopped working, and a scene with
+            # no intelligible speech in it (a long continuous action scene, or the
+            # music performance in #324). It was also inert under the built-in VAD,
+            # so it recorded a reassuring zero for exactly the runs that failed.
+            # The per-scene telemetry below records the facts instead.
+
+            # #394 diagnostics: per-scene record of decode behaviour and
+            # memory, so the *approach* to a failure is visible and not only its
+            # aftermath. On by default (raw_subs/ next to the outputs);
+            # --asr-telemetry moves it, --no-asr-telemetry switches it off.
+            telemetry = None
+            _tp = resolve_telemetry_path(
+                getattr(self, 'asr_telemetry_path', None),
+                getattr(self, 'asr_telemetry_enabled', True),
+                self.output_dir,
+                media_basename,
+                getattr(self, 'asr_telemetry_tag', None),
+            )
+            if _tp is not None:
+                telemetry = AsrTelemetry(_tp, media_basename)
+            # Reachable from the error handler below, which cannot see this local.
+            self._active_telemetry = telemetry
 
             # JSON-serializable ASR config for the workers
             asr_cfg = {
@@ -503,7 +625,8 @@ class BalancedPipeline(BasePipeline):
 
                         if item.get("ok"):
                             srt_path = Path(item["srt"])
-                            if srt_path.exists() and srt_path.stat().st_size > 0:
+                            _scene_produced = srt_path.exists() and srt_path.stat().st_size > 0
+                            if _scene_produced:
                                 scene_srt_info.append((srt_path, start_time_sec))
                                 master_metadata["scenes_detected"][idx]["transcribed"] = True
                                 master_metadata["scenes_detected"][idx]["srt_path"] = str(srt_path)
@@ -511,12 +634,69 @@ class BalancedPipeline(BasePipeline):
                                 master_metadata["scenes_detected"][idx]["transcribed"] = True
                                 master_metadata["scenes_detected"][idx]["no_speech_detected"] = True
                         else:
+                            _scene_produced = False
                             master_metadata["scenes_detected"][idx]["transcribed"] = False
                             master_metadata["scenes_detected"][idx]["error"] = item.get("error", "unknown")
                             self.progress.show_message(
                                 f"Scene {scene_num}/{total_scenes} failed: {item.get('error', '')}",
                                 "error", 2.0)
 
+                        # v1.9.2 (owner Part C), adapted to the subprocess workers:
+                        # the recogniser name arrives with the first batch result;
+                        # from then on every scene is reported on its own line.
+                        if _vad_method_name is None:
+                            _vad_method_name = item.get("segmenter", "none")
+                            _seg_label = (
+                                "Internal FW Silero VAD" if _vad_method_name == "none"
+                                else f"speech segmenter '{_vad_method_name}'"
+                            )
+
+                        # v1.9.2 (owner Part C): report what this scene actually
+                        # yielded. A scene that cost real time and returned nothing
+                        # is called out, because that is the condition worth noticing.
+                        _yield = 0
+                        try:
+                            if _scene_produced:
+                                _yield = Path(item["srt"]).read_text(encoding='utf-8').count(' --> ')
+                        except Exception:  # noqa: BLE001 - reporting must never break a run
+                            _yield = -1
+                        # One line per scene, newline-terminated. No carriage return
+                        # and no padding: the batch progress line below redraws in
+                        # place with \r, so a plain line cannot tear it.
+                        print(
+                            f"  Scene {scene_num}/{total_scenes} "
+                            f"({scene_paths[idx][3]:.0f}s, {_seg_label}): "
+                            f"{_yield} subtitle(s) in {float(item.get('wall_s', 0.0) or 0.0):.0f}s"
+                            f"{'  <-- NO OUTPUT' if _yield == 0 else ''}",
+                            flush=True,
+                        )
+
+                        # v1.9.2 (CFF1 / D2), adapted to the subprocess workers:
+                        # the model generation that decoded this scene is the
+                        # worker generation reported by the runner.
+                        _worker_epoch = item.get("worker_epoch", 1)
+                        master_metadata["scenes_detected"][idx]["model_epoch"] = _worker_epoch
+
+                        # #394 diagnostics: per-scene record of decode behaviour,
+                        # written from the decode stats the worker reported.
+                        if telemetry is not None:
+                            try:
+                                telemetry.record_scene(
+                                    index=scene_num,
+                                    audio_duration_s=scene_paths[idx][3],
+                                    wall_s=float(item.get("wall_s", 0.0) or 0.0),
+                                    segments=item.get("decode_stats", []) or [],
+                                    produced_output=_scene_produced,
+                                    model_epoch=_worker_epoch,
+                                )
+                            except Exception as _te:  # noqa: BLE001 - an observer never fails a run
+                                logger.debug("Telemetry record failed for scene %s: %s", scene_num, _te)
+
+                        # Speech regions, when an external detector actually
+                        # produced any. Under the built-in VAD this is empty by
+                        # design: the recogniser does its own detection and does
+                        # not report the regions it used, so there is nothing
+                        # honest to record here.
                         for seg in item.get("vad", []):
                             all_vad_segments.append({
                                 "start_sec": round(start_time_sec + seg["start_sec"], 3),
@@ -570,9 +750,14 @@ class BalancedPipeline(BasePipeline):
             self.progress.finish_subtask()
 
             # Save accumulated ASR-level VAD segments to metadata for visualization
+            # Only recorded when an external detector actually reported regions.
+            # This used to write vad_method "silero" and a set of Silero parameters
+            # for every run, including runs where no external detector ran at all.
             if all_vad_segments:
                 master_metadata["vad_segments"] = all_vad_segments
-                master_metadata["vad_method"] = "silero"
+                # v1.9.2 (owner Part C), adapted to the subprocess workers: the
+                # recogniser name arrives with the batch results (worker-reported).
+                master_metadata["vad_method"] = _vad_method_name or "unknown"
                 master_metadata["vad_params"] = self.vad_params
 
             # Print completion message for scene transcription (always visible)
@@ -649,6 +834,23 @@ class BalancedPipeline(BasePipeline):
 
             total_time = time.time() - start_time
             master_metadata["summary"]["total_processing_time_seconds"] = round(total_time, 2)
+            # Carried out with the rest of the summary so every caller sees it
+            # the same way: the plain path, the async path, and a pass running in
+            # its own process (agreed error-handling table, 2026-09-17).
+            master_metadata["summary"]["degradations"] = list(getattr(self, "degradations", None) or [])
+            # #394: every scene is already on disk; this logs the trend line.
+            if telemetry is not None:
+                telemetry.finalize()
+            self._active_telemetry = None
+
+            # v1.9.2 (CFF1), adapted to the subprocess workers: how often the
+            # recogniser was replaced during this file. The recogniser lives in
+            # the worker subprocess, so a "refresh" here is a worker recycle --
+            # the runner counts its own respawns (scene budget, RSS ceiling, or
+            # a worker crash).
+            master_metadata["summary"]["model_refresh_audio_minutes"] = self.model_refresh_audio_minutes
+            master_metadata["summary"]["model_refreshes"] = getattr(
+                runner, "worker_recycles", 0) if runner is not None else 0
             master_metadata["metadata_master"]["updated_at"] = datetime.now().isoformat() + "Z"
 
             self.metadata_manager.save_master_metadata(master_metadata, media_basename)
@@ -680,7 +882,13 @@ class BalancedPipeline(BasePipeline):
 
         except Exception as e:
             self.progress.show_message(f"Pipeline error: {str(e)}", "error", 0)
-            logger.error(f"Pipeline error: {e}", exc_info=True)
+            # A stop asked for by --fail-on suspect is not a crash: no traceback.
+            logger.error(f"Pipeline error: {e}", exc_info=not isinstance(e, AudioIntegrityStop))
+            # #394: the scenes recorded so far are already on disk; say where.
+            _t = getattr(self, '_active_telemetry', None)
+            if _t is not None:
+                _t.finalize()
+                self._active_telemetry = None
             self.metadata_manager.update_processing_stage(
                 master_metadata, "error", "failed", error_message=str(e))
             self.metadata_manager.save_master_metadata(master_metadata, media_basename)
